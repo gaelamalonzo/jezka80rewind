@@ -1,0 +1,10 @@
+{
+  "name": "Event Attendance System",
+  "description": "Corporate QR code event registration, individual and shared QR check-in, real-time attendance dashboard, role-based staff access, and Excel/CSV reporting backed by Firebase.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

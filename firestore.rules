@@ -1,0 +1,463 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Hardened Global Helpers
+    // -------------------------------------------------------------------------
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn()
+        && request.auth.token.email is string
+        && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string
+        && id.size() >= 2
+        && id.size() <= 128
+        && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidEmail(email) {
+      return email is string
+        && email.size() >= 5
+        && email.size() <= 120
+        && email.matches('^[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}$');
+    }
+
+    function isBootstrappedAdmin() {
+      return isVerifiedUser()
+        && request.auth.token.email == 'gaelamalonzo@gmail.com';
+    }
+
+    function hasStaffRole(roleName) {
+      return isVerifiedUser()
+        && exists(/databases/$(database)/documents/staff_roles/$(request.auth.token.email))
+        && get(/databases/$(database)/documents/staff_roles/$(request.auth.token.email)).data.active == true
+        && get(/databases/$(database)/documents/staff_roles/$(request.auth.token.email)).data.role == roleName;
+    }
+
+    function isAdmin() {
+      return isBootstrappedAdmin() || hasStaffRole('admin');
+    }
+
+    function isStaff() {
+      return isAdmin() || hasStaffRole('staff');
+    }
+
+    function eventExists(eventId) {
+      return exists(/databases/$(database)/documents/events/$(eventId));
+    }
+
+    function getEventData(eventId) {
+      return get(/databases/$(database)/documents/events/$(eventId)).data;
+    }
+
+    // -------------------------------------------------------------------------
+    // Validation Blueprints (Synchronized with firebase-blueprint.json)
+    // -------------------------------------------------------------------------
+    function isValidEvent(data, eventId) {
+      return data.keys().hasAll([
+          'id', 'title', 'description', 'eventDate', 'startTime', 'endTime',
+          'lateCutoffMinutes', 'venue', 'capacity', 'status', 'sharedQrEnabled',
+          'registrationOpen', 'createdByUid', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'title', 'description', 'eventDate', 'startTime', 'endTime',
+          'lateCutoffMinutes', 'venue', 'capacity', 'status', 'sharedQrEnabled',
+          'registrationOpen', 'createdByUid', 'createdAt', 'updatedAt'
+        ])
+        && data.id == eventId
+        && isValidId(data.id)
+        && data.id.size() <= 64
+        && data.title is string && data.title.size() >= 2 && data.title.size() <= 120
+        && data.description is string && data.description.size() <= 500
+        && data.eventDate is string && data.eventDate.size() == 10 && data.eventDate.matches('^\\d{4}-\\d{2}-\\d{2}$')
+        && data.startTime is string && data.startTime.size() == 5 && data.startTime.matches('^\\d{2}:\\d{2}$')
+        && data.endTime is string && data.endTime.size() == 5 && data.endTime.matches('^\\d{2}:\\d{2}$')
+        && data.lateCutoffMinutes is int && data.lateCutoffMinutes >= 0 && data.lateCutoffMinutes <= 480
+        && data.venue is string && data.venue.size() >= 2 && data.venue.size() <= 150
+        && data.capacity is int && data.capacity >= 1 && data.capacity <= 10000
+        && data.status in ['upcoming', 'active', 'completed', 'archived']
+        && data.sharedQrEnabled is bool
+        && data.registrationOpen is bool
+        && data.createdByUid is string && data.createdByUid.size() >= 1 && data.createdByUid.size() <= 128
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidQrToken(data, eventId, token) {
+      return data.keys().hasAll(['token', 'eventId', 'active', 'createdByUid', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['token', 'eventId', 'active', 'createdByUid', 'createdAt', 'updatedAt'])
+        && data.token == token
+        && isValidId(data.token)
+        && data.token.size() >= 12 && data.token.size() <= 64
+        && data.eventId == eventId
+        && isValidId(data.eventId)
+        && data.active is bool
+        && data.createdByUid is string && data.createdByUid.size() >= 1 && data.createdByUid.size() <= 128
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidStaffRole(data, emailKey) {
+      return data.keys().hasAll(['email', 'displayName', 'role', 'active', 'addedByEmail', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['email', 'displayName', 'role', 'active', 'addedByEmail', 'createdAt', 'updatedAt'])
+        && data.email == emailKey
+        && isValidEmail(data.email)
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 100
+        && data.role in ['admin', 'staff']
+        && data.active is bool
+        && isValidEmail(data.addedByEmail)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidParticipant(data, eventId, participantId) {
+      return data.keys().hasAll([
+          'id', 'eventId', 'fullName', 'email', 'mobile', 'company', 'position',
+          'qrSecret', 'registeredByUid', 'registrationSource', 'registrationDate',
+          'attendanceStatus', 'checkInAt', 'checkInMethod', 'checkedInByUid',
+          'checkedInByEmail', 'notes', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'eventId', 'fullName', 'email', 'mobile', 'company', 'position',
+          'qrSecret', 'registeredByUid', 'registrationSource', 'registrationDate',
+          'attendanceStatus', 'checkInAt', 'checkInMethod', 'checkedInByUid',
+          'checkedInByEmail', 'notes', 'updatedAt'
+        ])
+        && data.id == participantId
+        && isValidId(data.id)
+        && data.id.size() >= 6 && data.id.size() <= 64
+        && data.eventId == eventId
+        && isValidId(data.eventId)
+        && data.fullName is string && data.fullName.size() >= 2 && data.fullName.size() <= 100
+        && isValidEmail(data.email)
+        && data.mobile is string && data.mobile.size() >= 6 && data.mobile.size() <= 25
+        && data.company is string && data.company.size() >= 1 && data.company.size() <= 100
+        && data.position is string && data.position.size() >= 1 && data.position.size() <= 100
+        && isValidId(data.qrSecret) && data.qrSecret.size() >= 8 && data.qrSecret.size() <= 64
+        && data.registeredByUid is string && data.registeredByUid.size() >= 1 && data.registeredByUid.size() <= 128
+        && data.registrationSource in ['online', 'admin_manual', 'bulk_import']
+        && data.registrationDate is timestamp
+        && data.attendanceStatus in ['pending', 'present', 'late', 'absent']
+        && (data.checkInAt == null || data.checkInAt is timestamp)
+        && data.checkInMethod in ['individual_qr', 'shared_qr', 'manual_staff', 'admin_override', 'none']
+        && data.checkedInByUid is string && data.checkedInByUid.size() <= 128
+        && data.checkedInByEmail is string && data.checkedInByEmail.size() <= 120
+        && data.notes is string && data.notes.size() <= 300
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAttendanceLog(data, eventId, participantId) {
+      return data.keys().hasAll([
+          'participantId', 'eventId', 'participantName', 'company',
+          'status', 'method', 'qrTokenUsed', 'checkedInByUid',
+          'checkedInByEmail', 'checkedInAt'
+        ])
+        && data.keys().hasOnly([
+          'participantId', 'eventId', 'participantName', 'company',
+          'status', 'method', 'qrTokenUsed', 'checkedInByUid',
+          'checkedInByEmail', 'checkedInAt'
+        ])
+        && data.participantId == participantId
+        && isValidId(data.participantId)
+        && data.eventId == eventId
+        && isValidId(data.eventId)
+        && data.participantName is string && data.participantName.size() >= 2 && data.participantName.size() <= 100
+        && data.company is string && data.company.size() >= 1 && data.company.size() <= 100
+        && data.status in ['present', 'late']
+        && data.method in ['individual_qr', 'shared_qr', 'manual_staff', 'admin_override']
+        && data.qrTokenUsed is string && data.qrTokenUsed.size() <= 64
+        && data.checkedInByUid is string && data.checkedInByUid.size() >= 1 && data.checkedInByUid.size() <= 128
+        && data.checkedInByEmail is string && data.checkedInByEmail.size() <= 120
+        && data.checkedInAt is timestamp;
+    }
+
+    function isValidAuditLog(data, eventId, logId) {
+      return data.keys().hasAll([
+          'id', 'eventId', 'action', 'actorUid', 'actorEmail',
+          'actorRole', 'targetId', 'targetLabel', 'details', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'eventId', 'action', 'actorUid', 'actorEmail',
+          'actorRole', 'targetId', 'targetLabel', 'details', 'createdAt'
+        ])
+        && data.id == logId
+        && isValidId(data.id)
+        && data.eventId == eventId
+        && isValidId(data.eventId)
+        && data.action in [
+          'event_created', 'event_updated', 'shared_qr_toggled',
+          'participant_registered', 'participant_updated', 'participant_deleted',
+          'checkin_individual_qr', 'checkin_shared_qr', 'checkin_manual_staff',
+          'attendance_corrected', 'staff_role_updated', 'report_exported'
+        ]
+        && data.actorUid is string && data.actorUid.size() >= 1 && data.actorUid.size() <= 128
+        && data.actorEmail is string && data.actorEmail.size() <= 120
+        && data.actorRole in ['admin', 'staff', 'participant']
+        && data.targetId is string && data.targetId.size() <= 128
+        && data.targetLabel is string && data.targetLabel.size() <= 160
+        && data.details is string && data.details.size() <= 500
+        && data.createdAt is timestamp;
+    }
+
+    // -------------------------------------------------------------------------
+    // Collection Rules
+    // -------------------------------------------------------------------------
+
+    // Connection health check doc
+    match /test/connection {
+      allow get: if isSignedIn();
+    }
+
+    // Staff & Admin RBAC directory (PII: email)
+    match /staff_roles/{emailKey} {
+      allow get: if isValidEmail(emailKey) && (
+        isAdmin() || (isVerifiedUser() && request.auth.token.email == emailKey)
+      );
+      allow list: if isAdmin();
+      allow create: if isAdmin()
+        && isValidEmail(emailKey)
+        && isValidStaffRole(incoming(), emailKey)
+        && incoming().addedByEmail == request.auth.token.email
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isAdmin()
+        && isValidEmail(emailKey)
+        && isValidStaffRole(incoming(), emailKey)
+        && incoming().email == existing().email
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'role', 'active', 'addedByEmail', 'updatedAt']);
+      allow delete: if isAdmin() && isValidEmail(emailKey) && emailKey != 'gaelamalonzo@gmail.com';
+    }
+
+    // Events collection (non-PII schedule/venue metadata)
+    match /events/{eventId} {
+      allow get: if isValidId(eventId) && (
+        isStaff() || (isVerifiedUser() && existing().status in ['upcoming', 'active'])
+      );
+      allow list: if isStaff() || (isVerifiedUser() && resource.data.status in ['upcoming', 'active']);
+
+      allow create: if isAdmin()
+        && isValidId(eventId)
+        && isValidEvent(incoming(), eventId)
+        && incoming().createdByUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isAdmin()
+        && isValidId(eventId)
+        && isValidEvent(incoming(), eventId)
+        && incoming().id == existing().id
+        && incoming().createdByUid == existing().createdByUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'title', 'description', 'eventDate', 'startTime', 'endTime',
+          'lateCutoffMinutes', 'venue', 'capacity', 'status',
+          'sharedQrEnabled', 'registrationOpen', 'updatedAt'
+        ]);
+
+      allow delete: if isAdmin() && isValidId(eventId);
+
+      // Shared Event QR Tokens (Anti-enumeration)
+      match /qr_tokens/{token} {
+        allow get: if isValidId(eventId) && isValidId(token) && isVerifiedUser();
+        allow list: if isAdmin();
+        allow create: if isAdmin()
+          && isValidId(eventId) && isValidId(token)
+          && isValidQrToken(incoming(), eventId, token)
+          && eventExists(eventId)
+          && incoming().createdByUid == request.auth.uid
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+        allow update: if isAdmin()
+          && isValidId(eventId) && isValidId(token)
+          && isValidQrToken(incoming(), eventId, token)
+          && incoming().token == existing().token
+          && incoming().eventId == existing().eventId
+          && incoming().createdByUid == existing().createdByUid
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['active', 'updatedAt']);
+        allow delete: if isAdmin() && isValidId(eventId) && isValidId(token);
+      }
+
+      // Event Participants (PII isolated to Staff/Admin or matching verified owner)
+      match /participants/{participantId} {
+        allow get: if isValidId(eventId) && isValidId(participantId) && (
+          isStaff() || (
+            isVerifiedUser() && (
+              existing().registeredByUid == request.auth.uid ||
+              existing().email == request.auth.token.email
+            )
+          )
+        );
+
+        allow list: if isStaff() || (
+          isVerifiedUser() && (
+            resource.data.registeredByUid == request.auth.uid ||
+            resource.data.email == request.auth.token.email
+          )
+        );
+
+        allow create: if isVerifiedUser()
+          && isValidId(eventId)
+          && isValidId(participantId)
+          && isValidParticipant(incoming(), eventId, participantId)
+          && eventExists(eventId)
+          && incoming().registeredByUid == request.auth.uid
+          && incoming().registrationDate == request.time
+          && incoming().updatedAt == request.time
+          && incoming().attendanceStatus == 'pending'
+          && incoming().checkInAt == null
+          && incoming().checkInMethod == 'none'
+          && incoming().checkedInByUid == ''
+          && incoming().checkedInByEmail == ''
+          && (
+            isAdmin() || (
+              incoming().registrationSource == 'online'
+              && incoming().email == request.auth.token.email
+              && getEventData(eventId).registrationOpen == true
+              && getEventData(eventId).status in ['upcoming', 'active']
+            )
+          );
+
+        allow update: if isVerifiedUser()
+          && isValidId(eventId)
+          && isValidId(participantId)
+          && isValidParticipant(incoming(), eventId, participantId)
+          && incoming().id == existing().id
+          && incoming().eventId == existing().eventId
+          && incoming().qrSecret == existing().qrSecret
+          && incoming().registeredByUid == existing().registeredByUid
+          && incoming().registrationSource == existing().registrationSource
+          && incoming().registrationDate == existing().registrationDate
+          && incoming().updatedAt == request.time
+          && (
+            // Tier 1: Admin full edit / attendance correction
+            (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly([
+              'fullName', 'email', 'mobile', 'company', 'position',
+              'attendanceStatus', 'checkInAt', 'checkInMethod',
+              'checkedInByUid', 'checkedInByEmail', 'notes', 'updatedAt'
+            ]))
+            ||
+            // Tier 2A: Staff atomic check-in (only from pending -> present/late, must create attendance_logs doc)
+            (isStaff()
+              && existing().attendanceStatus == 'pending'
+              && incoming().attendanceStatus in ['present', 'late']
+              && incoming().checkInAt == request.time
+              && incoming().checkInMethod in ['individual_qr', 'manual_staff']
+              && incoming().checkedInByUid == request.auth.uid
+              && incoming().checkedInByEmail == request.auth.token.email
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'attendanceStatus', 'checkInAt', 'checkInMethod',
+                'checkedInByUid', 'checkedInByEmail', 'updatedAt'
+              ])
+              && existsAfter(/databases/$(database)/documents/events/$(eventId)/attendance_logs/$(participantId))
+            )
+            ||
+            // Tier 2B: Participant Shared QR atomic self-check-in (only from pending -> present/late)
+            ((existing().email == request.auth.token.email || existing().registeredByUid == request.auth.uid)
+              && existing().attendanceStatus == 'pending'
+              && incoming().attendanceStatus in ['present', 'late']
+              && incoming().checkInAt == request.time
+              && incoming().checkInMethod == 'shared_qr'
+              && incoming().checkedInByUid == request.auth.uid
+              && incoming().checkedInByEmail == request.auth.token.email
+              && getEventData(eventId).sharedQrEnabled == true
+              && getEventData(eventId).status == 'active'
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'attendanceStatus', 'checkInAt', 'checkInMethod',
+                'checkedInByUid', 'checkedInByEmail', 'updatedAt'
+              ])
+              && existsAfter(/databases/$(database)/documents/events/$(eventId)/attendance_logs/$(participantId))
+            )
+          );
+
+        allow delete: if isAdmin() && isValidId(eventId) && isValidId(participantId);
+      }
+
+      // Single-Use Atomic Check-In Receipts
+      match /attendance_logs/{participantId} {
+        allow get: if isValidId(eventId) && isValidId(participantId) && (
+          isStaff() || (isVerifiedUser() && existing().checkedInByUid == request.auth.uid)
+        );
+        allow list: if isStaff() || (isVerifiedUser() && resource.data.checkedInByUid == request.auth.uid);
+
+        allow create: if isVerifiedUser()
+          && isValidId(eventId)
+          && isValidId(participantId)
+          && isValidAttendanceLog(incoming(), eventId, participantId)
+          && eventExists(eventId)
+          && exists(/databases/$(database)/documents/events/$(eventId)/participants/$(participantId))
+          && incoming().checkedInByUid == request.auth.uid
+          && incoming().checkedInByEmail == request.auth.token.email
+          && incoming().checkedInAt == request.time
+          && (
+            (isStaff() && incoming().method in ['individual_qr', 'manual_staff', 'admin_override'])
+            ||
+            (incoming().method == 'shared_qr'
+              && getEventData(eventId).sharedQrEnabled == true
+              && getEventData(eventId).status == 'active'
+              && isValidId(incoming().qrTokenUsed)
+              && exists(/databases/$(database)/documents/events/$(eventId)/qr_tokens/$(incoming().qrTokenUsed))
+              && get(/databases/$(database)/documents/events/$(eventId)/qr_tokens/$(incoming().qrTokenUsed)).data.active == true
+            )
+          );
+
+        allow update: if isAdmin()
+          && isValidId(eventId) && isValidId(participantId)
+          && isValidAttendanceLog(incoming(), eventId, participantId)
+          && incoming().participantId == existing().participantId
+          && incoming().eventId == existing().eventId
+          && incoming().checkedInAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'method', 'checkedInByUid', 'checkedInByEmail', 'checkedInAt']);
+
+        allow delete: if isAdmin() && isValidId(eventId) && isValidId(participantId);
+      }
+
+      // Append-Only Audit Logs
+      match /audit_logs/{logId} {
+        allow get: if isValidId(eventId) && isValidId(logId) && isAdmin();
+        allow list: if isAdmin();
+
+        allow create: if isVerifiedUser()
+          && isValidId(eventId) && isValidId(logId)
+          && isValidAuditLog(incoming(), eventId, logId)
+          && eventExists(eventId)
+          && incoming().actorUid == request.auth.uid
+          && incoming().actorEmail == request.auth.token.email
+          && incoming().createdAt == request.time
+          && (
+            isAdmin()
+            || (isStaff() && incoming().actorRole == 'staff' && incoming().action in ['checkin_individual_qr', 'checkin_manual_staff', 'report_exported'])
+            || (incoming().actorRole == 'participant' && incoming().action in ['participant_registered', 'checkin_shared_qr'])
+          );
+
+        allow update: if false;
+        allow delete: if false;
+      }
+    }
+  }
+}
