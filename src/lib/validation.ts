@@ -1,10 +1,7 @@
 import type { EventRecord, QrTicketPayload } from '../types';
 
-/**
- * Verbatim validation constants synchronized with firebase-blueprint.json & firestore.rules.
- */
 export const CONSTRAINTS = {
-  ID_PATTERN: /^[a-zA-Z0-9_\-]+$/,
+  ID_PATTERN: /^[a-zA-Z0-9_.\-]+$/,
   EMAIL_PATTERN: /^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$/,
   DATE_PATTERN: /^\d{4}-\d{2}-\d{2}$/,
   TIME_PATTERN: /^\d{2}:\d{2}$/,
@@ -23,8 +20,9 @@ export const CONSTRAINTS = {
     CAPACITY_MAX: 10000,
   },
   PARTICIPANT: {
-    ID_MIN: 6,
+    ID_MIN: 2,
     ID_MAX: 64,
+    EMPLOYEE_ID_MAX: 64,
     NAME_MIN: 2,
     NAME_MAX: 100,
     EMAIL_MIN: 5,
@@ -45,17 +43,7 @@ export const CONSTRAINTS = {
     EMAIL_MIN: 5,
     EMAIL_MAX: 120,
   },
-  QR_TOKEN: {
-    MIN: 12,
-    MAX: 64,
-  },
-  AUDIT: {
-    TARGET_LABEL_MAX: 160,
-    DETAILS_MAX: 500,
-  },
 } as const;
-
-export const BOOTSTRAPPED_ADMIN_EMAIL = 'gaelamalonzo@gmail.com';
 
 export function sanitizeText(value: string, maxLength: number): string {
   return value.trim().replace(/\s+/g, ' ').slice(0, maxLength);
@@ -65,51 +53,16 @@ export function sanitizeEmail(value: string): string {
   return value.trim().toLowerCase().slice(0, CONSTRAINTS.PARTICIPANT.EMAIL_MAX);
 }
 
-export function generateRandomCode(length: number): string {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  const array = new Uint32Array(length);
-  crypto.getRandomValues(array);
-  let out = '';
-  for (let i = 0; i < length; i++) {
-    out += chars[array[i] % chars.length];
-  }
-  return out;
-}
-
-export function generateParticipantId(): string {
-  return `EVT-${generateRandomCode(6)}`;
-}
-
-export function generateQrSecret(): string {
-  return `sec_${generateRandomCode(16)}`;
-}
-
-export function generateSharedQrToken(): string {
-  return `SQ_${generateRandomCode(20)}`;
-}
-
-export function generateEventId(title: string): string {
-  const slug = title
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 24);
-  const suffix = generateRandomCode(6).toLowerCase();
-  const raw = slug ? `${slug}-${suffix}` : `event-${suffix}`;
-  return raw.slice(0, CONSTRAINTS.EVENT.ID_MAX);
-}
-
-export function generateLogId(): string {
-  return `log_${Date.now()}_${generateRandomCode(6)}`;
-}
-
-export function validateParticipantInput(input: {
-  fullName: string;
-  email: string;
-  mobile: string;
-  company: string;
-  position: string;
-}): string | null {
+export function validateParticipantInput(
+  input: {
+    fullName: string;
+    email: string;
+    mobile: string;
+    company: string;
+    position: string;
+  },
+  options?: { allowBlankContact?: boolean }
+): string | null {
   const name = sanitizeText(input.fullName, CONSTRAINTS.PARTICIPANT.NAME_MAX);
   const email = sanitizeEmail(input.email);
   const mobile = sanitizeText(input.mobile, CONSTRAINTS.PARTICIPANT.MOBILE_MAX);
@@ -119,11 +72,15 @@ export function validateParticipantInput(input: {
   if (name.length < CONSTRAINTS.PARTICIPANT.NAME_MIN) {
     return 'Full name must be at least 2 characters.';
   }
-  if (!CONSTRAINTS.EMAIL_PATTERN.test(email)) {
-    return 'Please provide a valid email address.';
+  if (!options?.allowBlankContact || email) {
+    if (!CONSTRAINTS.EMAIL_PATTERN.test(email)) {
+      return 'Please provide a valid email address.';
+    }
   }
-  if (mobile.length < CONSTRAINTS.PARTICIPANT.MOBILE_MIN) {
-    return 'Mobile number must be at least 6 characters.';
+  if (!options?.allowBlankContact || mobile) {
+    if (mobile.length < CONSTRAINTS.PARTICIPANT.MOBILE_MIN) {
+      return 'Mobile number must be at least 6 characters.';
+    }
   }
   if (company.length < CONSTRAINTS.PARTICIPANT.COMPANY_MIN) {
     return 'Company / Department is required.';
@@ -206,7 +163,7 @@ export function parseScannedQrText(raw: string): {
         };
       }
     } catch {
-      // fall through to URL / raw ID parsing
+      // fall through
     }
   }
 
@@ -221,7 +178,7 @@ export function parseScannedQrText(raw: string): {
       }
     }
   } catch {
-    // ignore URL parse error
+    // ignore
   }
 
   if (CONSTRAINTS.ID_PATTERN.test(trimmed) && trimmed.length >= CONSTRAINTS.PARTICIPANT.ID_MIN) {
@@ -231,9 +188,16 @@ export function parseScannedQrText(raw: string): {
   return null;
 }
 
-export function formatTimestamp(ts: { toDate: () => Date } | null | undefined): string {
+export function toMillis(ts: string | null | undefined): number {
+  if (!ts) return 0;
+  const parsed = Date.parse(ts);
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+export function formatTimestamp(ts: string | null | undefined): string {
   if (!ts) return '—';
-  const d = ts.toDate();
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return '—';
   return d.toLocaleString(undefined, {
     month: 'short',
     day: 'numeric',
@@ -244,9 +208,11 @@ export function formatTimestamp(ts: { toDate: () => Date } | null | undefined): 
   });
 }
 
-export function formatTimeOnly(ts: { toDate: () => Date } | null | undefined): string {
+export function formatTimeOnly(ts: string | null | undefined): string {
   if (!ts) return '—';
-  return ts.toDate().toLocaleTimeString(undefined, {
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return '—';
+  return d.toLocaleTimeString(undefined, {
     hour: '2-digit',
     minute: '2-digit',
     second: '2-digit',

@@ -7,51 +7,55 @@ import {
   Power,
   Printer,
   RefreshCw,
+  Rewind,
   ShieldAlert,
 } from 'lucide-react';
-import { collection, onSnapshot, query, where } from 'firebase/firestore';
 import { QRCodeSVG } from 'qrcode.react';
-import type { User } from 'firebase/auth';
-import { db, handleFirestoreError, OperationType } from '../lib/firebase';
-import { rotateSharedQrToken, toggleSharedQrStatus } from '../lib/attendanceService';
-import { buildSharedEventQrUrl, downloadSharedQrPosterPng } from '../lib/ticketUtils';
-import type { EffectiveRole, EventRecord, QrTokenRecord } from '../types';
+import { fetchQrTokens, rotateSharedQrToken, toggleSharedQrStatus } from '../lib/attendanceService';
+import {
+  buildSharedEventQrUrl,
+  downloadSharedQrPosterPng,
+  type QrDesignTheme,
+} from '../lib/ticketUtils';
+import type { AuthUser, EffectiveRole, EventRecord, QrTokenRecord } from '../types';
 
 interface Props {
   event: EventRecord | null;
   role: EffectiveRole;
-  user: User;
+  user: AuthUser;
+  onRefresh: () => Promise<void> | void;
   onNotify: (type: 'success' | 'error' | 'warning' | 'info', title: string, message?: string) => void;
 }
 
-export const SharedQrView: React.FC<Props> = ({ event, role, user, onNotify }) => {
+export const SharedQrView: React.FC<Props> = ({ event, role, onRefresh, onNotify }) => {
   const [tokens, setTokens] = useState<QrTokenRecord[]>([]);
   const [loadingTokens, setLoadingTokens] = useState(false);
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [theme, setTheme] = useState<QrDesignTheme>('jezka80_rewind');
+
+  const isRewind = theme === 'jezka80_rewind';
+
+  const loadTokens = async (eventId: string) => {
+    setLoadingTokens(true);
+    try {
+      const list = await fetchQrTokens(eventId);
+      setTokens(list);
+    } catch (error) {
+      onNotify('error', 'Token Load Failed', error instanceof Error ? error.message : 'Could not fetch QR tokens.');
+    } finally {
+      setLoadingTokens(false);
+    }
+  };
 
   useEffect(() => {
     if (!event || role !== 'admin') {
       setTokens([]);
       return;
     }
-    setLoadingTokens(true);
-    const path = `events/${event.id}/qr_tokens`;
-    const q = query(collection(db, 'events', event.id, 'qr_tokens'), where('active', '==', true));
-    const unsub = onSnapshot(
-      q,
-      (snap) => {
-        const list = snap.docs.map((d) => d.data() as QrTokenRecord);
-        setTokens(list);
-        setLoadingTokens(false);
-      },
-      (error) => {
-        setLoadingTokens(false);
-        handleFirestoreError(error, OperationType.LIST, path);
-      }
-    );
-    return () => unsub();
-  }, [event, role]);
+    void loadTokens(event.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [event?.id, role]);
 
   if (!event) {
     return (
@@ -89,10 +93,10 @@ export const SharedQrView: React.FC<Props> = ({ event, role, user, onNotify }) =
     setBusy(true);
     try {
       await toggleSharedQrStatus({
-        event,
+        eventId: event.id,
         enabled: !event.sharedQrEnabled,
-        user,
       });
+      await onRefresh();
       onNotify(
         'success',
         `Shared Event QR ${!event.sharedQrEnabled ? 'Enabled' : 'Disabled'}`,
@@ -110,12 +114,9 @@ export const SharedQrView: React.FC<Props> = ({ event, role, user, onNotify }) =
   const handleRotate = async () => {
     setBusy(true);
     try {
-      const nextToken = await rotateSharedQrToken({
-        eventId: event.id,
-        eventTitle: event.title,
-        existingTokens: tokens.map((t) => t.token),
-        user,
-      });
+      const nextToken = await rotateSharedQrToken(event.id);
+      await loadTokens(event.id);
+      await onRefresh();
       onNotify('success', 'QR Token Rotated', `Generated new Shared Event QR token (${nextToken}).`);
     } catch (error) {
       onNotify('error', 'Token Rotation Failed', error instanceof Error ? error.message : 'Unable to rotate token.');
@@ -200,71 +201,160 @@ export const SharedQrView: React.FC<Props> = ({ event, role, user, onNotify }) =
           </button>
         </div>
       ) : (
-        <div className="bg-white border border-slate-200 rounded-xl overflow-hidden max-w-2xl mx-auto">
-          <div className="bg-[#0B1D3A] text-white px-8 py-6 text-center">
-            <p className="text-xs font-medium text-slate-300 tracking-wide">
-              Self-Check-In Station · Scan with Mobile Camera
-            </p>
-            <h3 className="font-display text-2xl font-semibold mt-1 text-balance">{event.title}</h3>
-            <p className="text-xs text-slate-300 mt-2 tabular-nums">
-              {event.eventDate} · {event.startTime} – {event.endTime} · {event.venue}
-            </p>
-          </div>
-
-          <div className="p-8 flex flex-col items-center text-center space-y-5">
-            <div className="p-4 bg-white border border-slate-200 rounded-xl">
-              <QRCodeSVG value={selfCheckInUrl} size={260} level="H" fgColor="#0B1D3A" />
-            </div>
-
-            <div className="space-y-1">
-              <p className="text-xs text-slate-500">Active Security Token</p>
-              <p className="font-mono text-xs text-slate-700">{activeToken}</p>
-            </div>
-
-            <div className="text-xs text-slate-600 max-w-md space-y-1">
-              <p>1. Attendees scan this QR code using their mobile phone camera.</p>
-              <p>2. Verify Google identity and confirm Participant ID or Mobile number.</p>
-              <p>3. Anti-duplicate lock prevents multiple check-ins for the same attendee.</p>
+        <div className="max-w-2xl mx-auto space-y-3">
+          {/* Poster Theme Selector */}
+          <div className="flex items-center justify-between gap-3 no-print">
+            <span className="text-xs font-medium text-slate-500">Poster Artwork Theme</span>
+            <div className="inline-flex items-center gap-1 p-1 bg-slate-200/70 rounded-lg">
+              <button
+                type="button"
+                onClick={() => setTheme('jezka80_rewind')}
+                className={`px-3 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
+                  isRewind ? 'bg-[#0B1D3A] text-amber-300' : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                JEZKA80 REWIND
+              </button>
+              <button
+                type="button"
+                onClick={() => setTheme('corporate_navy')}
+                className={`px-3 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
+                  !isRewind ? 'bg-white text-[#0B1D3A]' : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                Corporate Classic
+              </button>
             </div>
           </div>
 
-          <div className="px-6 py-4 bg-slate-50 border-t border-slate-200 flex flex-wrap items-center justify-center gap-2.5 no-print">
-            <button
-              type="button"
-              onClick={() => downloadSharedQrPosterPng(event, activeToken)}
-              className="inline-flex items-center gap-2 px-4 py-2 bg-[#0B1D3A] hover:bg-[#132B52] text-white text-xs font-medium rounded-lg"
-            >
-              <Download className="w-3.5 h-3.5" />
-              <span>Download Poster PNG</span>
-            </button>
+          <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+            {/* Poster Header */}
+            <div className="relative bg-gradient-to-br from-[#061226] via-[#0B1D3A] to-[#172554] text-white px-8 py-7 text-center overflow-hidden">
+              {isRewind && (
+                <svg
+                  aria-hidden="true"
+                  className="absolute inset-0 w-full h-full opacity-25 pointer-events-none"
+                  viewBox="0 0 800 220"
+                  preserveAspectRatio="none"
+                >
+                  <defs>
+                    <linearGradient id="posterSun" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor="#F59E0B" />
+                      <stop offset="100%" stopColor="#E11D48" />
+                    </linearGradient>
+                  </defs>
+                  <circle cx="400" cy="120" r="88" fill="url(#posterSun)" opacity="0.45" />
+                  <rect x="300" y="122" width="200" height="6" fill="#0B1D3A" />
+                  <rect x="300" y="140" width="200" height="6" fill="#0B1D3A" />
+                  <rect x="300" y="158" width="200" height="6" fill="#0B1D3A" />
+                  <path
+                    d="M0 165 H800 M0 190 H800 M400 20 L60 220 M400 20 L230 220 M400 20 L570 220 M400 20 L740 220"
+                    stroke="#38BDF8"
+                    strokeWidth="1.2"
+                    opacity="0.4"
+                  />
+                </svg>
+              )}
 
-            <button
-              type="button"
-              onClick={() => window.print()}
-              className="inline-flex items-center gap-2 px-4 py-2 bg-white border border-slate-300 hover:bg-slate-50 text-slate-800 text-xs font-medium rounded-lg"
-            >
-              <Printer className="w-3.5 h-3.5" />
-              <span>Print Poster</span>
-            </button>
+              <div className="relative z-10">
+                <div className="inline-flex items-center justify-center gap-2 text-xs font-semibold tracking-wide">
+                  {isRewind ? (
+                    <>
+                      <Rewind className="w-4 h-4 text-amber-300 shrink-0" />
+                      <span className="text-amber-300">JEZKA80 REWIND · MOBILE SELF-CHECK-IN</span>
+                    </>
+                  ) : (
+                    <span className="text-slate-300">SELF-CHECK-IN STATION · SCAN WITH MOBILE CAMERA</span>
+                  )}
+                </div>
+                <h3 className="font-display text-3xl font-semibold mt-1.5 text-balance">
+                  {event.title}
+                </h3>
+                <p className="text-xs text-slate-300 mt-2 tabular-nums">
+                  {event.eventDate} · {event.startTime} – {event.endTime} · {event.venue}
+                </p>
+              </div>
+            </div>
 
-            <button
-              type="button"
-              onClick={handleCopy}
-              className="inline-flex items-center gap-2 px-4 py-2 bg-white border border-slate-300 hover:bg-slate-50 text-slate-800 text-xs font-medium rounded-lg"
-            >
-              {copied ? <Check className="w-3.5 h-3.5 text-emerald-700" /> : <Copy className="w-3.5 h-3.5" />}
-              <span>{copied ? 'Link Copied' : 'Copy Check-In Link'}</span>
-            </button>
+            {isRewind && (
+              <div className="flex flex-col">
+                <div className="h-1.5 w-full bg-amber-500" />
+                <div className="h-1.5 w-full bg-rose-600" />
+                <div className="h-1.5 w-full bg-sky-400" />
+              </div>
+            )}
 
-            <a
-              href={selfCheckInUrl}
-              target="_blank"
-              rel="noreferrer"
-              className="inline-flex items-center gap-2 px-4 py-2 bg-[#1E40AF] hover:bg-[#1B3B6F] text-white text-xs font-medium rounded-lg"
-            >
-              <ExternalLink className="w-3.5 h-3.5" />
-              <span>Open Mobile Self-Check-In</span>
-            </a>
+            <div className="p-8 flex flex-col items-center text-center space-y-5">
+              <div className="relative p-5 bg-white border border-slate-200 rounded-xl">
+                {isRewind && (
+                  <>
+                    <span className="absolute -top-0.5 -left-0.5 w-5 h-5 border-t-[3px] border-l-[3px] border-rose-600" />
+                    <span className="absolute -top-0.5 -right-0.5 w-5 h-5 border-t-[3px] border-r-[3px] border-rose-600" />
+                    <span className="absolute -bottom-0.5 -left-0.5 w-5 h-5 border-b-[3px] border-l-[3px] border-rose-600" />
+                    <span className="absolute -bottom-0.5 -right-0.5 w-5 h-5 border-b-[3px] border-r-[3px] border-rose-600" />
+                  </>
+                )}
+                <QRCodeSVG value={selfCheckInUrl} size={260} level="H" fgColor="#0B1D3A" />
+              </div>
+
+              <div className="space-y-1">
+                <p className="text-xs text-slate-500">Active Security Token</p>
+                <p className="font-mono text-xs text-slate-700">{activeToken}</p>
+              </div>
+
+              <div className="text-xs text-slate-600 max-w-md space-y-1">
+                <p>1. Attendees scan this QR code using their mobile phone camera.</p>
+                <p>2. Enter registered Email or ID and verify Participant ID or Mobile number.</p>
+                <p>3. Anti-duplicate lock prevents multiple check-ins for the same attendee.</p>
+              </div>
+            </div>
+
+            {isRewind && (
+              <div className="flex flex-col">
+                <div className="h-1 w-full bg-amber-500" />
+                <div className="h-1 w-full bg-rose-600" />
+                <div className="h-1 w-full bg-sky-400" />
+              </div>
+            )}
+
+            <div className="px-6 py-4 bg-slate-50 border-t border-slate-200 flex flex-wrap items-center justify-center gap-2.5 no-print">
+              <button
+                type="button"
+                onClick={() => downloadSharedQrPosterPng(event, activeToken, theme)}
+                className="inline-flex items-center gap-2 px-4 py-2 bg-[#0B1D3A] hover:bg-[#132B52] text-white text-xs font-medium rounded-lg"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>Download Poster PNG</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => window.print()}
+                className="inline-flex items-center gap-2 px-4 py-2 bg-white border border-slate-300 hover:bg-slate-50 text-slate-800 text-xs font-medium rounded-lg"
+              >
+                <Printer className="w-3.5 h-3.5" />
+                <span>Print Poster</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleCopy}
+                className="inline-flex items-center gap-2 px-4 py-2 bg-white border border-slate-300 hover:bg-slate-50 text-slate-800 text-xs font-medium rounded-lg"
+              >
+                {copied ? <Check className="w-3.5 h-3.5 text-emerald-700" /> : <Copy className="w-3.5 h-3.5" />}
+                <span>{copied ? 'Link Copied' : 'Copy Check-In Link'}</span>
+              </button>
+
+              <a
+                href={selfCheckInUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-2 px-4 py-2 bg-[#1E40AF] hover:bg-[#1B3B6F] text-white text-xs font-medium rounded-lg"
+              >
+                <ExternalLink className="w-3.5 h-3.5" />
+                <span>Open Mobile Self-Check-In</span>
+              </a>
+            </div>
           </div>
         </div>
       )}

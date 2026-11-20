@@ -1,30 +1,19 @@
-import React, { useEffect, useState } from 'react';
-import { onAuthStateChanged, type User } from 'firebase/auth';
+import React, { useCallback, useEffect, useState } from 'react';
+import { KeyRound, QrCode, ShieldCheck, UserCheck } from 'lucide-react';
 import {
-  collection,
-  doc,
-  getDoc,
-  onSnapshot,
-  orderBy,
-  query,
-} from 'firebase/firestore';
-import { QrCode, ShieldCheck, UserCheck } from 'lucide-react';
-import {
-  auth,
-  db,
-  handleFirestoreError,
-  OperationType,
-  signInWithGoogle,
-  signOutUser,
-  testConnection,
-} from './lib/firebase';
-import { BOOTSTRAPPED_ADMIN_EMAIL, sanitizeEmail } from './lib/validation';
+  bootstrapAdmin,
+  fetchAuthStatus,
+  fetchEvents,
+  fetchParticipants,
+  getStoredSessionToken,
+  loginStaff,
+  logoutStaff,
+} from './lib/attendanceService';
 import type {
   AppView,
-  EffectiveRole,
+  AuthUser,
   EventRecord,
   ParticipantRecord,
-  StaffRoleRecord,
 } from './types';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { SidebarLayout } from './components/SidebarLayout';
@@ -67,9 +56,14 @@ function parseUrlParams(): UrlPortalState {
 function EventAttendanceApp() {
   const [urlState, setUrlState] = useState(parseUrlParams);
   const [authReady, setAuthReady] = useState(false);
-  const [currentUser, setCurrentUser] = useState<User | null>(null);
-  const [role, setRole] = useState<EffectiveRole>('participant');
-  const [resolvingRole, setResolvingRole] = useState(false);
+  const [needsBootstrap, setNeedsBootstrap] = useState(false);
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+
+  // Auth form fields
+  const [authDisplayName, setAuthDisplayName] = useState('Event Administrator');
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [signInBusy, setSignInBusy] = useState(false);
 
   const [events, setEvents] = useState<EventRecord[]>([]);
   const [selectedEventId, setSelectedEventId] = useState<string>('');
@@ -78,135 +72,160 @@ function EventAttendanceApp() {
 
   const [activeView, setActiveView] = useState<AppView>('dashboard');
   const [notification, setNotification] = useState<NotificationState | null>(null);
-  const [signInBusy, setSignInBusy] = useState(false);
 
   const notify = (type: NotificationState['type'], title: string, message?: string) => {
     setNotification({ id: Date.now(), type, title, message });
   };
 
   useEffect(() => {
-    void testConnection();
-  }, []);
-
-  useEffect(() => {
-    const unsub = onAuthStateChanged(auth, async (user) => {
-      setCurrentUser(user);
-      if (!user || !user.email) {
-        setRole('participant');
-        setAuthReady(true);
-        return;
-      }
-
-      setResolvingRole(true);
+    let cancelled = false;
+    async function initAuth() {
       try {
-        const cleanEmail = sanitizeEmail(user.email);
-        if (cleanEmail === BOOTSTRAPPED_ADMIN_EMAIL && user.emailVerified) {
-          setRole('admin');
-        } else if (user.emailVerified) {
-          const staffSnap = await getDoc(doc(db, 'staff_roles', cleanEmail));
-          if (staffSnap.exists()) {
-            const staffData = staffSnap.data() as StaffRoleRecord;
-            if (staffData.active) {
-              setRole(staffData.role);
-            } else {
-              setRole('participant');
-            }
-          } else {
-            setRole('participant');
-          }
-        } else {
-          setRole('participant');
+        const res = await fetchAuthStatus();
+        if (!cancelled) {
+          setNeedsBootstrap(res.needsBootstrap);
+          setAuthUser(res.user);
         }
       } catch {
-        setRole('participant');
+        if (!cancelled) {
+          setAuthUser(null);
+        }
       } finally {
-        setResolvingRole(false);
-        setAuthReady(true);
+        if (!cancelled) setAuthReady(true);
       }
-    });
-
-    return () => unsub();
+    }
+    void initAuth();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  // Load events list for Admin / Staff workspace
+  const loadEventsData = useCallback(async () => {
+    if (!authUser) return;
+    try {
+      const list = await fetchEvents();
+      setEvents(list);
+      setSelectedEventId((prev) => {
+        if (prev && list.some((e) => e.id === prev)) return prev;
+        const activeOne = list.find((e) => e.status === 'active');
+        return activeOne?.id || list[0]?.id || '';
+      });
+    } catch (error) {
+      notify('error', 'Failed to Load Events', error instanceof Error ? error.message : 'Unable to fetch events.');
+    }
+  }, [authUser]);
+
+  const loadParticipantsData = useCallback(
+    async (eventId: string) => {
+      if (!authUser || !eventId) {
+        setParticipants([]);
+        return;
+      }
+      setLoadingParticipants(true);
+      try {
+        const list = await fetchParticipants(eventId);
+        setParticipants(list);
+      } catch (error) {
+        notify(
+          'error',
+          'Failed to Load Roster',
+          error instanceof Error ? error.message : 'Unable to fetch participants.'
+        );
+      } finally {
+        setLoadingParticipants(false);
+      }
+    },
+    [authUser]
+  );
+
+  const refreshAll = useCallback(async () => {
+    await loadEventsData();
+    if (selectedEventId) {
+      await loadParticipantsData(selectedEventId);
+    }
+  }, [loadEventsData, loadParticipantsData, selectedEventId]);
+
   useEffect(() => {
-    if (!authReady || !currentUser || (role !== 'admin' && role !== 'staff') || urlState.portalMode) {
+    if (!authReady || !authUser || urlState.portalMode) {
       setEvents([]);
       return;
     }
+    void loadEventsData();
+  }, [authReady, authUser, urlState.portalMode, loadEventsData]);
 
-    const path = 'events';
-    const q = query(collection(db, 'events'), orderBy('eventDate', 'desc'));
-    const unsub = onSnapshot(
-      q,
-      (snap) => {
-        const list = snap.docs.map((d) => d.data() as EventRecord);
-        setEvents(list);
-        setSelectedEventId((prev) => {
-          if (prev && list.some((e) => e.id === prev)) return prev;
-          const activeOne = list.find((e) => e.status === 'active');
-          return activeOne?.id || list[0]?.id || '';
-        });
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, path);
-      }
-    );
-
-    return () => unsub();
-  }, [authReady, currentUser, role, urlState.portalMode]);
-
-  // Load real-time participants for active event (Admin / Staff)
   useEffect(() => {
-    if (
-      !authReady ||
-      !currentUser ||
-      !selectedEventId ||
-      (role !== 'admin' && role !== 'staff') ||
-      urlState.portalMode
-    ) {
+    if (!authReady || !authUser || !selectedEventId || urlState.portalMode) {
       setParticipants([]);
       return;
     }
+    void loadParticipantsData(selectedEventId);
 
-    setLoadingParticipants(true);
-    const path = `events/${selectedEventId}/participants`;
-    const q = query(
-      collection(db, 'events', selectedEventId, 'participants'),
-      orderBy('registrationDate', 'desc')
+    // Subscribe to live SSE updates for simultaneous multi-device staff sync
+    const token = getStoredSessionToken();
+    if (!token) return;
+    const es = new EventSource(
+      `/api/events/${encodeURIComponent(selectedEventId)}/stream?token=${encodeURIComponent(token)}`
     );
+    es.onmessage = () => {
+      void loadEventsData();
+      void loadParticipantsData(selectedEventId);
+    };
+    return () => {
+      es.close();
+    };
+  }, [authReady, authUser, selectedEventId, urlState.portalMode, loadEventsData, loadParticipantsData]);
 
-    const unsub = onSnapshot(
-      q,
-      (snap) => {
-        setParticipants(snap.docs.map((d) => d.data() as ParticipantRecord));
-        setLoadingParticipants(false);
-      },
-      (error) => {
-        setLoadingParticipants(false);
-        handleFirestoreError(error, OperationType.LIST, path);
-      }
-    );
-
-    return () => unsub();
-  }, [authReady, currentUser, selectedEventId, role, urlState.portalMode]);
-
-  const handleGoogleSignIn = async () => {
+  const handleBootstrap = async (e: React.FormEvent) => {
+    e.preventDefault();
     setSignInBusy(true);
     try {
-      await signInWithGoogle();
+      const res = await bootstrapAdmin({
+        email: authEmail,
+        displayName: authDisplayName,
+        password: authPassword,
+      });
+      setNeedsBootstrap(false);
+      setAuthUser(res.user);
+      setAuthPassword('');
+      notify('success', 'Administrator Initialized', `Signed in as ${res.user.email}.`);
     } catch (error) {
       notify(
         'error',
-        'Sign-In Failed',
-        error instanceof Error ? error.message : 'Unable to complete Google sign-in.'
+        'Setup Failed',
+        error instanceof Error ? error.message : 'Unable to initialize administrator.'
       );
     } finally {
       setSignInBusy(false);
     }
   };
 
-  if (!authReady || resolvingRole) {
+  const handleLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSignInBusy(true);
+    try {
+      const res = await loginStaff({ email: authEmail, password: authPassword });
+      setAuthUser(res.user);
+      setAuthPassword('');
+    } catch (error) {
+      notify(
+        'error',
+        'Sign-In Failed',
+        error instanceof Error ? error.message : 'Invalid email or password.'
+      );
+    } finally {
+      setSignInBusy(false);
+    }
+  };
+
+  const handleSignOut = () => {
+    logoutStaff();
+    setAuthUser(null);
+    setEvents([]);
+    setParticipants([]);
+    setSelectedEventId('');
+  };
+
+  if (!authReady) {
     return (
       <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
         <div className="text-center space-y-2">
@@ -225,19 +244,23 @@ function EventAttendanceApp() {
         eventIdParam={urlState.eventIdParam}
         tokenParam={urlState.tokenParam}
         ticketIdParam={urlState.ticketParam}
-        user={currentUser}
-        role={role}
-        canReturnToConsole={role === 'admin' || role === 'staff'}
+        role={authUser?.role || 'participant'}
+        canReturnToConsole={Boolean(authUser)}
         onReturnToConsole={() => {
           window.history.replaceState({}, '', window.location.pathname);
-          setUrlState({ portalMode: null, eventIdParam: undefined, tokenParam: undefined, ticketParam: undefined });
+          setUrlState({
+            portalMode: null,
+            eventIdParam: undefined,
+            tokenParam: undefined,
+            ticketParam: undefined,
+          });
         }}
       />
     );
   }
 
-  // Signed-out Corporate Landing Screen
-  if (!currentUser) {
+  // Signed-out Corporate Landing & Auth / First-Time Admin Setup Screen
+  if (!authUser) {
     return (
       <div className="min-h-screen bg-slate-50 flex flex-col justify-between">
         <header className="h-16 bg-white border-b border-slate-200 px-6 sm:px-10 flex items-center justify-between gap-8">
@@ -248,17 +271,9 @@ function EventAttendanceApp() {
             <button
               type="button"
               onClick={() => setUrlState({ portalMode: 'register' })}
-              className="text-sm font-medium text-slate-600 hover:text-[#0B1D3A] whitespace-nowrap"
+              className="px-4 py-2 bg-[#0B1D3A] hover:bg-[#132B52] text-white text-xs font-medium rounded-lg transition-colors whitespace-nowrap"
             >
-              Participant Registration
-            </button>
-            <button
-              type="button"
-              disabled={signInBusy}
-              onClick={handleGoogleSignIn}
-              className="px-4 py-2 bg-[#0B1D3A] hover:bg-[#132B52] text-white text-xs font-medium rounded-lg transition-colors whitespace-nowrap disabled:opacity-50"
-            >
-              {signInBusy ? 'Signing In...' : 'Sign In with Google'}
+              Online Participant Registration
             </button>
           </div>
         </header>
@@ -268,107 +283,139 @@ function EventAttendanceApp() {
             <div className="lg:col-span-7 p-8 sm:p-10 space-y-6">
               <div>
                 <p className="text-xs font-semibold text-[#1E40AF] uppercase tracking-wider">
-                  Corporate Event Operations
+                  {needsBootstrap ? 'First-Time Server Setup' : 'Corporate Event Operations'}
                 </p>
-                <h1 className="font-display text-3xl font-semibold text-[#0B1D3A] mt-2 text-balance">
-                  QR Code Event Attendance &amp; Check-In Platform
+                <h1 className="font-display text-2xl sm:text-3xl font-semibold text-[#0B1D3A] mt-2 text-balance">
+                  {needsBootstrap
+                    ? 'Initialize Administrator Account'
+                    : 'QR Code Event Attendance & Check-In'}
                 </h1>
-                <p className="text-sm text-slate-600 mt-3 leading-relaxed">
-                  Built for 500–1,000 participant company events with simultaneous multi-staff scanning, online ticket registration, mobile self-check-in, and real-time Excel/CSV reporting.
+                <p className="text-sm text-slate-600 mt-2 leading-relaxed">
+                  {needsBootstrap
+                    ? 'Create the primary Administrator login to configure your company event, manage staff scanners, and issue JEZKA80 REWIND QR passes.'
+                    : 'Sign in with your Administrator or Staff credentials for 500–1,000 participant check-in, live dashboard updates, and Excel/CSV exports.'}
                 </p>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2 text-xs text-slate-700">
-                <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-lg space-y-1">
-                  <div className="flex items-center gap-2 font-semibold text-[#0B1D3A]">
-                    <QrCode className="w-4 h-4" />
-                    <span>Dual QR Modes</span>
-                  </div>
-                  <p className="text-slate-600">
-                    Individual participant QR tickets plus toggleable Shared Event QR self-check-in.
-                  </p>
-                </div>
-                <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-lg space-y-1">
-                  <div className="flex items-center gap-2 font-semibold text-[#0B1D3A]">
-                    <ShieldCheck className="w-4 h-4" />
-                    <span>Atomic Anti-Duplicate</span>
-                  </div>
-                  <p className="text-slate-600">
-                    Cloud Firestore transactions prevent duplicate scans and maintain audit history.
-                  </p>
-                </div>
               </div>
 
               {notification && (
                 <NotificationBanner notification={notification} onDismiss={() => setNotification(null)} />
               )}
 
-              <div className="flex flex-wrap items-center gap-3 pt-2">
-                <button
-                  type="button"
-                  disabled={signInBusy}
-                  onClick={handleGoogleSignIn}
-                  className="inline-flex items-center gap-2 px-5 py-2.5 bg-[#0B1D3A] hover:bg-[#132B52] text-white text-sm font-medium rounded-lg transition-colors disabled:opacity-50"
-                >
-                  <UserCheck className="w-4 h-4" />
-                  <span>{signInBusy ? 'Signing In...' : 'Admin & Staff Sign In'}</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setUrlState({ portalMode: 'register' })}
-                  className="px-4 py-2.5 bg-white border border-slate-300 hover:bg-slate-50 text-slate-800 text-sm font-medium rounded-lg transition-colors"
-                >
-                  Participant Registration Portal
-                </button>
-              </div>
+              <form onSubmit={needsBootstrap ? handleBootstrap : handleLogin} className="space-y-4">
+                {needsBootstrap && (
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">
+                      Administrator Name
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      maxLength={100}
+                      value={authDisplayName}
+                      onChange={(e) => setAuthDisplayName(e.target.value)}
+                      className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#1E40AF]"
+                    />
+                  </div>
+                )}
+
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Email Address
+                  </label>
+                  <input
+                    type="email"
+                    required
+                    value={authEmail}
+                    onChange={(e) => setAuthEmail(e.target.value)}
+                    placeholder="admin@company.com"
+                    className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#1E40AF]"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Password {needsBootstrap && '(min. 8 characters)'}
+                  </label>
+                  <div className="relative">
+                    <KeyRound className="w-4 h-4 text-slate-400 absolute left-3 top-3" />
+                    <input
+                      type="password"
+                      required
+                      minLength={needsBootstrap ? 8 : 1}
+                      value={authPassword}
+                      onChange={(e) => setAuthPassword(e.target.value)}
+                      placeholder="Enter password"
+                      className="w-full pl-9 pr-3 py-2.5 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#1E40AF]"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-3 pt-1">
+                  <button
+                    type="submit"
+                    disabled={signInBusy}
+                    className="inline-flex items-center gap-2 px-5 py-2.5 bg-[#0B1D3A] hover:bg-[#132B52] text-white text-sm font-medium rounded-lg transition-colors disabled:opacity-50"
+                  >
+                    <UserCheck className="w-4 h-4" />
+                    <span>
+                      {signInBusy
+                        ? 'Authenticating...'
+                        : needsBootstrap
+                          ? 'Create Admin & Enter Console'
+                          : 'Admin & Staff Sign In'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setUrlState({ portalMode: 'register' })}
+                    className="px-4 py-2.5 bg-white border border-slate-300 hover:bg-slate-50 text-slate-800 text-sm font-medium rounded-lg transition-colors"
+                  >
+                    Participant Registration
+                  </button>
+                </div>
+              </form>
             </div>
 
             <div className="lg:col-span-5 bg-[#0B1D3A] text-white p-8 sm:p-10 flex flex-col justify-between space-y-6">
               <div className="space-y-4">
-                <h2 className="font-display text-lg font-semibold">Role Permissions</h2>
+                <div className="flex items-center gap-2 text-amber-300 text-xs font-semibold tracking-wide">
+                  <QrCode className="w-4 h-4" />
+                  <span>JEZKA80 REWIND READY</span>
+                </div>
+                <h2 className="font-display text-lg font-semibold">Platform Capabilities</h2>
                 <div className="space-y-3 text-xs text-slate-300 leading-relaxed">
                   <div>
                     <p className="font-semibold text-white">Event Administrator</p>
-                    <p>Full event setup, bulk CSV/XLSX imports, staff access control, attendance corrections, and Shared QR toggle.</p>
+                    <p>Full event setup, bulk CSV/XLSX imports, staff account management, attendance corrections, and Shared QR toggle.</p>
                   </div>
                   <div className="border-t border-white/10 pt-3">
                     <p className="font-semibold text-white">Check-In Staff</p>
-                    <p>Camera QR scanning, authorized manual check-in, and real-time attendance roster viewing.</p>
+                    <p>Simultaneous multi-device QR scanning, authorized manual entry, and real-time attendance roster viewing.</p>
                   </div>
                   <div className="border-t border-white/10 pt-3">
                     <p className="font-semibold text-white">Participants</p>
-                    <p>Online registration, downloadable Individual QR Tickets, and mobile self-check-in.</p>
+                    <p>Open online registration, downloadable JEZKA80 REWIND QR tickets, and mobile Shared QR self-check-in.</p>
                   </div>
                 </div>
               </div>
-              <p className="text-xs text-slate-400">
-                Backed by Firebase Authentication &amp; Cloud Firestore
-              </p>
+              <div className="flex items-center gap-2 text-xs text-slate-300">
+                <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+                <span>Self-contained SQLite Database + Live SSE Sync ($0 Free)</span>
+              </div>
             </div>
           </div>
         </main>
 
         <footer className="py-4 px-6 text-center text-xs text-slate-500">
-          Event Attendance System · Corporate Check-In &amp; Reporting
+          Event Attendance System · Standalone Corporate Check-In &amp; Reporting
         </footer>
       </div>
     );
   }
 
-  // Signed-in regular user without Admin/Staff role -> Route to Participant Portal cleanly
-  if (role === 'participant') {
-    return (
-      <ParticipantPortal
-        mode="register"
-        user={currentUser}
-        role={role}
-        canReturnToConsole={false}
-        onReturnToConsole={() => {}}
-      />
-    );
-  }
-
   const selectedEvent = events.find((e) => e.id === selectedEventId) || null;
+  const role = authUser.role;
 
   return (
     <SidebarLayout
@@ -378,24 +425,25 @@ function EventAttendanceApp() {
         setActiveView(v);
       }}
       role={role}
-      userEmail={currentUser.email || ''}
-      userName={currentUser.displayName || ''}
+      userEmail={authUser.email}
+      userName={authUser.displayName}
       events={events}
       selectedEventId={selectedEventId}
       onSelectEvent={(id) => setSelectedEventId(id)}
-      onSignOut={() => signOutUser()}
+      onSignOut={handleSignOut}
     >
       <NotificationBanner notification={notification} onDismiss={() => setNotification(null)} />
 
       {activeView === 'dashboard' && (
         <DashboardView
           role={role}
-          user={currentUser}
+          user={authUser}
           events={events}
           selectedEvent={selectedEvent}
           participants={participants}
           loadingParticipants={loadingParticipants}
           onSelectEvent={(id) => setSelectedEventId(id)}
+          onRefresh={refreshAll}
           onNotify={notify}
           onNavigate={(view) => setActiveView(view)}
         />
@@ -406,7 +454,8 @@ function EventAttendanceApp() {
           event={selectedEvent}
           participants={participants}
           role={role}
-          user={currentUser}
+          user={authUser}
+          onRefresh={refreshAll}
           onNotify={notify}
         />
       )}
@@ -416,7 +465,8 @@ function EventAttendanceApp() {
           events={events}
           selectedEvent={selectedEvent}
           role={role}
-          user={currentUser}
+          user={authUser}
+          onRefresh={refreshAll}
           onNotify={notify}
         />
       )}
@@ -425,7 +475,8 @@ function EventAttendanceApp() {
         <SharedQrView
           event={selectedEvent}
           role={role}
-          user={currentUser}
+          user={authUser}
+          onRefresh={refreshAll}
           onNotify={notify}
         />
       )}
@@ -435,7 +486,8 @@ function EventAttendanceApp() {
           event={selectedEvent}
           participants={participants}
           role={role}
-          user={currentUser}
+          user={authUser}
+          onRefresh={refreshAll}
           onNotify={notify}
         />
       )}
@@ -445,14 +497,14 @@ function EventAttendanceApp() {
           event={selectedEvent}
           participants={participants}
           role={role}
-          user={currentUser}
+          user={authUser}
           onNotify={notify}
         />
       )}
 
       {activeView === 'access' && role === 'admin' && (
         <AccessSetupView
-          user={currentUser}
+          user={authUser}
           selectedEventId={selectedEventId}
           onNotify={notify}
         />

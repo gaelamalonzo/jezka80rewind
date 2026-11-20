@@ -1,10 +1,13 @@
 import React, { useRef, useState } from 'react';
-import { Check, Copy, ExternalLink, FileSpreadsheet, Upload, UserPlus } from 'lucide-react';
-import type { User } from 'firebase/auth';
-import type { EffectiveRole, EventRecord, ParticipantRecord } from '../types';
-import { bulkImportParticipants, registerParticipant } from '../lib/attendanceService';
+import { Check, Copy, ExternalLink, FileSpreadsheet, Upload, UserPlus, X } from 'lucide-react';
+import type { AuthUser, EffectiveRole, EventRecord, ParticipantRecord } from '../types';
+import { bulkImportParticipants, registerParticipantStaff } from '../lib/attendanceService';
 import { buildOnlineRegistrationUrl } from '../lib/ticketUtils';
-import { downloadBulkImportTemplateCsv, parseBulkSpreadsheet } from '../lib/reportUtils';
+import {
+  downloadBulkImportTemplateCsv,
+  parseBulkSpreadsheet,
+  type ParsedBulkRow,
+} from '../lib/reportUtils';
 import { validateParticipantInput } from '../lib/validation';
 import { ParticipantTicketCard } from './ParticipantTicketCard';
 
@@ -12,7 +15,8 @@ interface Props {
   events: EventRecord[];
   selectedEvent: EventRecord | null;
   role: EffectiveRole;
-  user: User;
+  user: AuthUser;
+  onRefresh: () => Promise<void> | void;
   onNotify: (type: 'success' | 'error' | 'warning' | 'info', title: string, message?: string) => void;
 }
 
@@ -20,17 +24,24 @@ export const RegistrationView: React.FC<Props> = ({
   events,
   selectedEvent,
   role,
-  user,
+  onRefresh,
   onNotify,
 }) => {
   const [targetEventId, setTargetEventId] = useState(selectedEvent?.id || events[0]?.id || '');
+  const [employeeId, setEmployeeId] = useState('');
+  const [useEmpIdSingle, setUseEmpIdSingle] = useState(true);
   const [fullName, setFullName] = useState('');
   const [email, setEmail] = useState('');
   const [mobile, setMobile] = useState('');
   const [company, setCompany] = useState('');
   const [position, setPosition] = useState('');
   const [submitting, setSubmitting] = useState(false);
+
   const [importing, setImporting] = useState(false);
+  const [pendingImportFile, setPendingImportFile] = useState<string>('');
+  const [pendingImportRows, setPendingImportRows] = useState<ParsedBulkRow[]>([]);
+  const [useEmployeeIdAsId, setUseEmployeeIdAsId] = useState(true);
+
   const [copiedLink, setCopiedLink] = useState(false);
   const [issuedTicket, setIssuedTicket] = useState<{
     participant: ParticipantRecord;
@@ -61,13 +72,16 @@ export const RegistrationView: React.FC<Props> = ({
       return;
     }
 
-    const validationErr = validateParticipantInput({
-      fullName,
-      email,
-      mobile,
-      company,
-      position,
-    });
+    const validationErr = validateParticipantInput(
+      {
+        fullName,
+        email,
+        mobile,
+        company,
+        position,
+      },
+      { allowBlankContact: Boolean(employeeId.trim()) }
+    );
     if (validationErr) {
       onNotify('error', 'Validation Error', validationErr);
       return;
@@ -75,50 +89,29 @@ export const RegistrationView: React.FC<Props> = ({
 
     setSubmitting(true);
     try {
-      const { participantId, qrSecret } = await registerParticipant({
+      const { participant } = await registerParticipantStaff({
         eventId: activeEvent.id,
-        eventTitle: activeEvent.title,
+        employeeId: employeeId.trim(),
+        useEmployeeIdAsId: useEmpIdSingle,
         fullName,
         email,
         mobile,
         company,
         position,
-        source: role === 'admin' ? 'admin_manual' : 'online',
-        actorRole: role,
-        user,
       });
 
-      const created: ParticipantRecord = {
-        id: participantId,
-        eventId: activeEvent.id,
-        fullName: fullName.trim(),
-        email: email.trim().toLowerCase(),
-        mobile: mobile.trim(),
-        company: company.trim(),
-        position: position.trim(),
-        qrSecret,
-        registeredByUid: user.uid,
-        registrationSource: role === 'admin' ? 'admin_manual' : 'online',
-        registrationDate: null,
-        attendanceStatus: 'pending',
-        checkInAt: null,
-        checkInMethod: 'none',
-        checkedInByUid: '',
-        checkedInByEmail: '',
-        notes: '',
-        updatedAt: null,
-      };
-
-      setIssuedTicket({ participant: created, event: activeEvent });
+      setIssuedTicket({ participant, event: activeEvent });
+      setEmployeeId('');
       setFullName('');
       setEmail('');
       setMobile('');
       setCompany('');
       setPosition('');
+      await onRefresh();
       onNotify(
         'success',
         'Participant Registered',
-        `Issued Unique ID ${participantId} and generated individual QR ticket.`
+        `Issued Pass ID ${participant.id}${participant.employeeId ? ` (Emp ID: ${participant.employeeId})` : ''}.`
       );
     } catch (error) {
       onNotify('error', 'Registration Failed', error instanceof Error ? error.message : 'Unable to register.');
@@ -127,50 +120,50 @@ export const RegistrationView: React.FC<Props> = ({
     }
   };
 
-  const handleBulkUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleSelectBulkFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !activeEvent) return;
-    setImporting(true);
     try {
       const rows = await parseBulkSpreadsheet(file);
       if (rows.length === 0) {
-        onNotify('warning', 'Empty Spreadsheet', 'Ensure columns include Full Name, Email, Mobile, Company, and Position.');
+        onNotify(
+          'warning',
+          'No Attendees Found',
+          'Ensure your Excel/CSV has at least a Full Name column (plus optional Employee ID No, Email, Mobile, Company, Position).'
+        );
         return;
       }
+      setPendingImportFile(file.name);
+      setPendingImportRows(rows);
+    } catch (error) {
+      onNotify('error', 'File Read Failed', error instanceof Error ? error.message : 'Unable to parse spreadsheet.');
+    } finally {
+      if (importInputRef.current) importInputRef.current.value = '';
+    }
+  };
 
-      const validRows = rows.filter(
-        (r) =>
-          !validateParticipantInput({
-            fullName: r.fullName,
-            email: r.email,
-            mobile: r.mobile || '0000000',
-            company: r.company,
-            position: r.position,
-          })
-      );
-
-      if (validRows.length === 0) {
-        onNotify('error', 'No Valid Rows', 'Check email addresses and required fields in your spreadsheet.');
-        return;
-      }
-
-      const count = await bulkImportParticipants({
+  const handleConfirmBulkImport = async () => {
+    if (!activeEvent || pendingImportRows.length === 0) return;
+    setImporting(true);
+    try {
+      const { imported, skipped } = await bulkImportParticipants({
         eventId: activeEvent.id,
-        eventTitle: activeEvent.title,
-        rows: validRows.map((r) => ({ ...r, mobile: r.mobile || 'N/A-0000' })),
-        user,
+        useEmployeeIdAsId,
+        rows: pendingImportRows,
       });
 
+      setPendingImportRows([]);
+      setPendingImportFile('');
+      await onRefresh();
       onNotify(
         'success',
         'Bulk Import Complete',
-        `Imported ${count} participants into ${activeEvent.title} with unique QR secrets.`
+        `Imported ${imported} attendees into ${activeEvent.title}${skipped > 0 ? ` (${skipped} duplicates/invalid rows skipped)` : ''}.`
       );
     } catch (error) {
-      onNotify('error', 'Bulk Import Failed', error instanceof Error ? error.message : 'Unable to parse spreadsheet.');
+      onNotify('error', 'Bulk Import Failed', error instanceof Error ? error.message : 'Unable to import attendees.');
     } finally {
       setImporting(false);
-      if (importInputRef.current) importInputRef.current.value = '';
     }
   };
 
@@ -215,6 +208,113 @@ export const RegistrationView: React.FC<Props> = ({
         </div>
       </div>
 
+      {/* Bulk Import Preview Drawer / Card */}
+      {role === 'admin' && pendingImportRows.length > 0 && (
+        <div className="bg-white border border-[#1E40AF]/40 rounded-xl overflow-hidden no-print">
+          <div className="px-6 py-4 bg-[#0B1D3A] text-white flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h3 className="font-display text-base font-semibold">
+                Import Preview: {pendingImportFile}
+              </h3>
+              <p className="text-xs text-slate-300 tabular-nums mt-0.5">
+                {pendingImportRows.length} attendees ready to import into {activeEvent?.title}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setPendingImportRows([]);
+                setPendingImportFile('');
+              }}
+              className="p-1.5 rounded-lg text-slate-300 hover:bg-white/10"
+              aria-label="Cancel import preview"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+
+          <div className="p-6 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-slate-50 border border-slate-200 rounded-lg p-4">
+              <label className="inline-flex items-start gap-2.5 text-xs text-slate-700 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={useEmployeeIdAsId}
+                  onChange={(e) => setUseEmployeeIdAsId(e.target.checked)}
+                  className="mt-0.5 rounded border-slate-300 text-[#1E40AF] focus:ring-[#1E40AF]"
+                />
+                <span>
+                  <span className="font-semibold text-[#0B1D3A] block">
+                    Use Employee ID No. as Check-In / Participant ID (when unique)
+                  </span>
+                  <span className="text-slate-500">
+                    Allows employees and staff scanners to check in directly using their Employee ID No.
+                  </span>
+                </span>
+              </label>
+
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPendingImportRows([]);
+                    setPendingImportFile('');
+                  }}
+                  className="px-3.5 py-2 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 text-xs font-medium rounded-lg"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  disabled={importing}
+                  onClick={handleConfirmBulkImport}
+                  className="px-4 py-2 bg-[#1E40AF] hover:bg-[#1B3B6F] text-white text-xs font-medium rounded-lg disabled:opacity-50 whitespace-nowrap"
+                >
+                  {importing
+                    ? 'Importing Roster...'
+                    : `Confirm & Import ${pendingImportRows.length} Attendees`}
+                </button>
+              </div>
+            </div>
+
+            <div className="border border-slate-200 rounded-lg overflow-x-auto max-h-72 overflow-y-auto">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead className="sticky top-0 bg-slate-50 border-b border-slate-200 text-slate-600 font-semibold">
+                  <tr>
+                    <th className="py-2 px-3">#</th>
+                    <th className="py-2 px-3">Employee ID No.</th>
+                    <th className="py-2 px-3">Full Name</th>
+                    <th className="py-2 px-3">Email</th>
+                    <th className="py-2 px-3">Mobile</th>
+                    <th className="py-2 px-3">Company / Dept</th>
+                    <th className="py-2 px-3">Position</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {pendingImportRows.slice(0, 100).map((row, idx) => (
+                    <tr key={`${row.employeeId}-${row.fullName}-${idx}`}>
+                      <td className="py-2 px-3 font-mono text-slate-400 tabular-nums">{idx + 1}</td>
+                      <td className="py-2 px-3 font-mono font-medium text-[#0B1D3A]">
+                        {row.employeeId || 'Auto (EVT-...)'}
+                      </td>
+                      <td className="py-2 px-3 font-medium text-slate-900">{row.fullName}</td>
+                      <td className="py-2 px-3 text-slate-600">{row.email || '—'}</td>
+                      <td className="py-2 px-3 tabular-nums text-slate-600">{row.mobile || '—'}</td>
+                      <td className="py-2 px-3 text-slate-700">{row.company}</td>
+                      <td className="py-2 px-3 text-slate-600">{row.position}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {pendingImportRows.length > 100 && (
+              <p className="text-xs text-slate-500">
+                Showing first 100 of {pendingImportRows.length} parsed attendees. All {pendingImportRows.length} rows will be imported.
+              </p>
+            )}
+          </div>
+        </div>
+      )}
+
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
         {/* Registration Form + Bulk Import */}
         <div className="lg:col-span-6 space-y-6 no-print">
@@ -244,29 +344,56 @@ export const RegistrationView: React.FC<Props> = ({
                 </select>
               </div>
 
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  Full Name
-                </label>
-                <input
-                  type="text"
-                  required
-                  maxLength={100}
-                  value={fullName}
-                  onChange={(e) => setFullName(e.target.value)}
-                  placeholder="Alex Mercer"
-                  className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#1E40AF]"
-                />
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Full Name
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    maxLength={100}
+                    value={fullName}
+                    onChange={(e) => setFullName(e.target.value)}
+                    placeholder="Alex Mercer"
+                    className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#1E40AF]"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Employee ID No. (Optional)
+                  </label>
+                  <input
+                    type="text"
+                    maxLength={64}
+                    value={employeeId}
+                    onChange={(e) => setEmployeeId(e.target.value)}
+                    placeholder="EMP-1042"
+                    className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-[#1E40AF]"
+                  />
+                </div>
               </div>
+
+              {employeeId.trim() && (
+                <label className="inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={useEmpIdSingle}
+                    onChange={(e) => setUseEmpIdSingle(e.target.checked)}
+                    className="rounded border-slate-300 text-[#1E40AF] focus:ring-[#1E40AF]"
+                  />
+                  <span>Use Employee ID No. as Participant Check-In ID</span>
+                </label>
+              )}
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Email Address
+                    Email Address {employeeId.trim() ? '(Optional)' : ''}
                   </label>
                   <input
                     type="email"
-                    required
+                    required={!employeeId.trim()}
                     maxLength={120}
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
@@ -276,11 +403,11 @@ export const RegistrationView: React.FC<Props> = ({
                 </div>
                 <div>
                   <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Mobile Number
+                    Mobile Number {employeeId.trim() ? '(Optional)' : ''}
                   </label>
                   <input
                     type="tel"
-                    required
+                    required={!employeeId.trim()}
                     maxLength={25}
                     value={mobile}
                     onChange={(e) => setMobile(e.target.value)}
@@ -338,20 +465,20 @@ export const RegistrationView: React.FC<Props> = ({
                 <div className="flex items-center gap-2.5">
                   <FileSpreadsheet className="w-5 h-5 text-[#0B1D3A]" />
                   <h3 className="font-display text-base font-semibold text-[#0B1D3A]">
-                    Bulk Roster Import (500–1,000 Participants)
+                    Bulk Roster Import (500–1,000+ Attendees)
                   </h3>
                 </div>
               </div>
               <p className="text-xs text-slate-600 leading-relaxed">
-                Upload an Excel (<code className="font-mono">.xlsx</code>) or CSV file with columns:{' '}
-                <span className="font-medium">Full Name, Email, Mobile, Company, Position</span>. Unique IDs and QR tokens are generated automatically in batches.
+                Upload an Excel (<code className="font-mono">.xlsx</code> / <code className="font-mono">.xls</code>) or CSV file with columns:{' '}
+                <span className="font-medium">Employee ID No, Full Name, Email, Mobile, Company / Department, Position</span>. Email and Mobile are optional when importing employee lists; Employee ID No. can be used directly for check-in.
               </p>
               <div className="flex flex-wrap items-center gap-3">
                 <input
                   ref={importInputRef}
                   type="file"
                   accept=".xlsx,.xls,.csv"
-                  onChange={handleBulkUpload}
+                  onChange={handleSelectBulkFile}
                   className="hidden"
                 />
                 <button
@@ -361,7 +488,7 @@ export const RegistrationView: React.FC<Props> = ({
                   className="inline-flex items-center gap-2 px-4 py-2 bg-[#1E40AF] hover:bg-[#1B3B6F] text-white text-xs font-medium rounded-lg disabled:opacity-50"
                 >
                   <Upload className="w-3.5 h-3.5" />
-                  <span>{importing ? 'Importing Roster...' : 'Upload XLSX / CSV Roster'}</span>
+                  <span>{importing ? 'Importing Roster...' : 'Select XLSX / CSV Roster'}</span>
                 </button>
                 <button
                   type="button"
@@ -388,7 +515,7 @@ export const RegistrationView: React.FC<Props> = ({
                 Individual QR Ticket Preview
               </p>
               <p className="text-sm text-slate-500 mt-2 max-w-sm mx-auto">
-                Complete the registration form to generate a unique Participant ID and downloadable corporate QR pass.
+                Complete the registration form or upload your employee Excel/CSV list to issue JEZKA80 REWIND QR passes.
               </p>
             </div>
           )}

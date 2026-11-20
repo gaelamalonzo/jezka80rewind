@@ -1,5 +1,3 @@
-import type { Timestamp } from 'firebase/firestore';
-
 export type EventStatus = 'upcoming' | 'active' | 'completed' | 'archived';
 export type AttendanceStatus = 'pending' | 'present' | 'late' | 'absent';
 export type CheckInMethod =
@@ -26,6 +24,13 @@ export type AuditAction =
   | 'staff_role_updated'
   | 'report_exported';
 
+export interface AuthUser {
+  uid: string;
+  email: string;
+  displayName: string;
+  role: StaffRoleType;
+}
+
 export interface EventRecord {
   id: string;
   title: string;
@@ -40,8 +45,8 @@ export interface EventRecord {
   sharedQrEnabled: boolean;
   registrationOpen: boolean;
   createdByUid: string;
-  createdAt: Timestamp | null;
-  updatedAt: Timestamp | null;
+  createdAt: string | null;
+  updatedAt: string | null;
 }
 
 export interface QrTokenRecord {
@@ -49,8 +54,8 @@ export interface QrTokenRecord {
   eventId: string;
   active: boolean;
   createdByUid: string;
-  createdAt: Timestamp | null;
-  updatedAt: Timestamp | null;
+  createdAt: string | null;
+  updatedAt: string | null;
 }
 
 export interface StaffRoleRecord {
@@ -59,12 +64,13 @@ export interface StaffRoleRecord {
   role: StaffRoleType;
   active: boolean;
   addedByEmail: string;
-  createdAt: Timestamp | null;
-  updatedAt: Timestamp | null;
+  createdAt: string | null;
+  updatedAt: string | null;
 }
 
 export interface ParticipantRecord {
   id: string;
+  employeeId: string;
   eventId: string;
   fullName: string;
   email: string;
@@ -74,27 +80,14 @@ export interface ParticipantRecord {
   qrSecret: string;
   registeredByUid: string;
   registrationSource: RegistrationSource;
-  registrationDate: Timestamp | null;
+  registrationDate: string | null;
   attendanceStatus: AttendanceStatus;
-  checkInAt: Timestamp | null;
+  checkInAt: string | null;
   checkInMethod: CheckInMethod;
   checkedInByUid: string;
   checkedInByEmail: string;
   notes: string;
-  updatedAt: Timestamp | null;
-}
-
-export interface AttendanceLogRecord {
-  participantId: string;
-  eventId: string;
-  participantName: string;
-  company: string;
-  status: 'present' | 'late';
-  method: Exclude<CheckInMethod, 'none'>;
-  qrTokenUsed: string;
-  checkedInByUid: string;
-  checkedInByEmail: string;
-  checkedInAt: Timestamp | null;
+  updatedAt: string | null;
 }
 
 export interface AuditLogRecord {
@@ -107,7 +100,7 @@ export interface AuditLogRecord {
   targetId: string;
   targetLabel: string;
   details: string;
-  createdAt: Timestamp | null;
+  createdAt: string | null;
 }
 
 export interface QrTicketPayload {

@@ -1,22 +1,15 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import {
-  collection,
-  limit,
-  onSnapshot,
-  orderBy,
-  query,
-} from 'firebase/firestore';
 import { Edit3, QrCode, Search, Trash2, X } from 'lucide-react';
-import type { User } from 'firebase/auth';
-import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import {
   adminCorrectParticipant,
   adminDeleteParticipant,
+  fetchAuditLogs,
 } from '../lib/attendanceService';
 import { formatTimestamp, validateParticipantInput } from '../lib/validation';
 import type {
   AttendanceStatus,
   AuditLogRecord,
+  AuthUser,
   EffectiveRole,
   EventRecord,
   ParticipantRecord,
@@ -27,7 +20,8 @@ interface Props {
   event: EventRecord | null;
   participants: ParticipantRecord[];
   role: EffectiveRole;
-  user: User;
+  user: AuthUser;
+  onRefresh: () => Promise<void> | void;
   onNotify: (type: 'success' | 'error' | 'warning' | 'info', title: string, message?: string) => void;
 }
 
@@ -37,7 +31,7 @@ export const AttendanceAuditView: React.FC<Props> = ({
   event,
   participants,
   role,
-  user,
+  onRefresh,
   onNotify,
 }) => {
   const [subTab, setSubTab] = useState<'roster' | 'audit'>('roster');
@@ -51,6 +45,7 @@ export const AttendanceAuditView: React.FC<Props> = ({
 
   const [ticketModalParticipant, setTicketModalParticipant] = useState<ParticipantRecord | null>(null);
   const [editingParticipant, setEditingParticipant] = useState<ParticipantRecord | null>(null);
+  const [editEmployeeId, setEditEmployeeId] = useState('');
   const [editFullName, setEditFullName] = useState('');
   const [editEmail, setEditEmail] = useState('');
   const [editMobile, setEditMobile] = useState('');
@@ -64,28 +59,23 @@ export const AttendanceAuditView: React.FC<Props> = ({
     setPage(1);
   }, [searchText, statusFilter, methodFilter, event?.id]);
 
+  const loadAudit = async (eventId: string) => {
+    setLoadingAudit(true);
+    try {
+      const logs = await fetchAuditLogs(eventId);
+      setAuditLogs(logs);
+    } catch (error) {
+      onNotify('error', 'Audit Load Failed', error instanceof Error ? error.message : 'Unable to fetch audit history.');
+    } finally {
+      setLoadingAudit(false);
+    }
+  };
+
   useEffect(() => {
     if (!event || role !== 'admin' || subTab !== 'audit') return;
-    setLoadingAudit(true);
-    const path = `events/${event.id}/audit_logs`;
-    const q = query(
-      collection(db, 'events', event.id, 'audit_logs'),
-      orderBy('createdAt', 'desc'),
-      limit(200)
-    );
-    const unsub = onSnapshot(
-      q,
-      (snap) => {
-        setAuditLogs(snap.docs.map((d) => d.data() as AuditLogRecord));
-        setLoadingAudit(false);
-      },
-      (error) => {
-        setLoadingAudit(false);
-        handleFirestoreError(error, OperationType.LIST, path);
-      }
-    );
-    return () => unsub();
-  }, [event, role, subTab]);
+    void loadAudit(event.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [event?.id, role, subTab, participants.length]);
 
   const filteredParticipants = useMemo(() => {
     const q = searchText.trim().toLowerCase();
@@ -95,6 +85,7 @@ export const AttendanceAuditView: React.FC<Props> = ({
       if (!q) return true;
       return (
         p.id.toLowerCase().includes(q) ||
+        (p.employeeId && p.employeeId.toLowerCase().includes(q)) ||
         p.fullName.toLowerCase().includes(q) ||
         p.email.toLowerCase().includes(q) ||
         p.company.toLowerCase().includes(q) ||
@@ -108,6 +99,7 @@ export const AttendanceAuditView: React.FC<Props> = ({
 
   const openEditModal = (p: ParticipantRecord) => {
     setEditingParticipant(p);
+    setEditEmployeeId(p.employeeId || '');
     setEditFullName(p.fullName);
     setEditEmail(p.email);
     setEditMobile(p.mobile);
@@ -120,13 +112,16 @@ export const AttendanceAuditView: React.FC<Props> = ({
   const handleSaveCorrection = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!event || !editingParticipant) return;
-    const err = validateParticipantInput({
-      fullName: editFullName,
-      email: editEmail,
-      mobile: editMobile,
-      company: editCompany,
-      position: editPosition,
-    });
+    const err = validateParticipantInput(
+      {
+        fullName: editFullName,
+        email: editEmail,
+        mobile: editMobile,
+        company: editCompany,
+        position: editPosition,
+      },
+      { allowBlankContact: true }
+    );
     if (err) {
       onNotify('error', 'Validation Error', err);
       return;
@@ -135,8 +130,9 @@ export const AttendanceAuditView: React.FC<Props> = ({
     try {
       await adminCorrectParticipant({
         eventId: event.id,
-        participant: editingParticipant,
+        participantId: editingParticipant.id,
         updates: {
+          employeeId: editEmployeeId.trim(),
           fullName: editFullName,
           email: editEmail,
           mobile: editMobile,
@@ -145,9 +141,9 @@ export const AttendanceAuditView: React.FC<Props> = ({
           attendanceStatus: editStatus,
           notes: editNotes,
         },
-        user,
       });
       setEditingParticipant(null);
+      await onRefresh();
       onNotify('success', 'Record Updated', `Updated attendance record for ${editFullName} and logged to audit trail.`);
     } catch (error) {
       onNotify('error', 'Update Failed', error instanceof Error ? error.message : 'Unable to save correction.');
@@ -160,8 +156,9 @@ export const AttendanceAuditView: React.FC<Props> = ({
     if (!event || role !== 'admin') return;
     setSaving(true);
     try {
-      await adminDeleteParticipant({ eventId: event.id, participant: p, user });
+      await adminDeleteParticipant(event.id, p.id);
       setEditingParticipant(null);
+      await onRefresh();
       onNotify('info', 'Participant Removed', `Deleted registration ${p.id} (${p.fullName}).`);
     } catch (error) {
       onNotify('error', 'Delete Failed', error instanceof Error ? error.message : 'Unable to remove participant.');
@@ -216,7 +213,7 @@ export const AttendanceAuditView: React.FC<Props> = ({
                 type="text"
                 value={searchText}
                 onChange={(e) => setSearchText(e.target.value)}
-                placeholder="Search ID, full name, email, company..."
+                placeholder="Search ID, Employee ID No., name, email, company..."
                 className="w-full pl-9 pr-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#1E40AF]"
               />
             </div>
@@ -284,13 +281,16 @@ export const AttendanceAuditView: React.FC<Props> = ({
                             : 'text-slate-500';
                     return (
                       <tr key={p.id} className="hover:bg-slate-50/80">
-                        <td className="py-2.5 px-4 font-mono tabular-nums text-xs font-medium text-[#0B1D3A] whitespace-nowrap">
-                          {p.id}
+                        <td className="py-2.5 px-4 font-mono tabular-nums text-xs whitespace-nowrap">
+                          <div className="font-medium text-[#0B1D3A]">{p.id}</div>
+                          {p.employeeId && p.employeeId !== p.id && (
+                            <div className="text-[11px] text-slate-500">Emp: {p.employeeId}</div>
+                          )}
                         </td>
                         <td className="py-2.5 px-4">
                           <div className="font-medium text-slate-900">{p.fullName}</div>
                           <div className="text-xs text-slate-500">
-                            {p.email} · <span className="tabular-nums">{p.mobile}</span>
+                            {p.email || '—'} · <span className="tabular-nums">{p.mobile || '—'}</span>
                           </div>
                         </td>
                         <td className="py-2.5 px-4">
@@ -455,20 +455,35 @@ export const AttendanceAuditView: React.FC<Props> = ({
             </div>
 
             <form onSubmit={handleSaveCorrection} className="p-6 space-y-4">
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  Attendance Status
-                </label>
-                <select
-                  value={editStatus}
-                  onChange={(e) => setEditStatus(e.target.value as AttendanceStatus)}
-                  className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm font-medium focus:outline-none focus:ring-2 focus:ring-[#1E40AF]"
-                >
-                  <option value="pending">Pending (Resets check-in lock)</option>
-                  <option value="present">Present (On Time)</option>
-                  <option value="late">Late Arrival</option>
-                  <option value="absent">Absent</option>
-                </select>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Attendance Status
+                  </label>
+                  <select
+                    value={editStatus}
+                    onChange={(e) => setEditStatus(e.target.value as AttendanceStatus)}
+                    className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm font-medium focus:outline-none focus:ring-2 focus:ring-[#1E40AF]"
+                  >
+                    <option value="pending">Pending (Resets check-in lock)</option>
+                    <option value="present">Present (On Time)</option>
+                    <option value="late">Late Arrival</option>
+                    <option value="absent">Absent</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Employee ID No.
+                  </label>
+                  <input
+                    type="text"
+                    maxLength={64}
+                    value={editEmployeeId}
+                    onChange={(e) => setEditEmployeeId(e.target.value)}
+                    placeholder="EMP-1042"
+                    className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm font-mono"
+                  />
+                </div>
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -487,7 +502,6 @@ export const AttendanceAuditView: React.FC<Props> = ({
                   <label className="block text-xs font-semibold text-slate-700 mb-1">Email</label>
                   <input
                     type="email"
-                    required
                     maxLength={120}
                     value={editEmail}
                     onChange={(e) => setEditEmail(e.target.value)}
@@ -501,7 +515,6 @@ export const AttendanceAuditView: React.FC<Props> = ({
                   <label className="block text-xs font-semibold text-slate-700 mb-1">Mobile</label>
                   <input
                     type="text"
-                    required
                     maxLength={25}
                     value={editMobile}
                     onChange={(e) => setEditMobile(e.target.value)}

@@ -1,28 +1,18 @@
 import React, { useEffect, useState } from 'react';
 import {
-  collection,
-  doc,
-  getDoc,
-  getDocs,
-  query,
-  where,
-} from 'firebase/firestore';
-import {
   AlertTriangle,
   ArrowLeft,
   Calendar,
   CheckCircle2,
-  LogOut,
   QrCode,
-  ShieldCheck,
   Ticket,
 } from 'lucide-react';
-import type { User } from 'firebase/auth';
-import { db, handleFirestoreError, OperationType, signInWithGoogle, signOutUser } from '../lib/firebase';
 import {
-  findParticipantForSelfCheckIn,
-  performAtomicCheckIn,
-  registerParticipant,
+  fetchPublicEvents,
+  fetchPublicEventStatus,
+  fetchPublicTicket,
+  performPublicSelfCheckIn,
+  registerParticipantPublic,
 } from '../lib/attendanceService';
 import {
   formatTimestamp,
@@ -33,7 +23,6 @@ import type {
   EffectiveRole,
   EventRecord,
   ParticipantRecord,
-  QrTokenRecord,
 } from '../types';
 import { ParticipantTicketCard } from './ParticipantTicketCard';
 import { NotificationBanner, type NotificationState } from './NotificationBanner';
@@ -43,7 +32,6 @@ interface Props {
   eventIdParam?: string;
   tokenParam?: string;
   ticketIdParam?: string;
-  user: User | null;
   role: EffectiveRole;
   canReturnToConsole: boolean;
   onReturnToConsole: () => void;
@@ -54,7 +42,6 @@ export const ParticipantPortal: React.FC<Props> = ({
   eventIdParam,
   tokenParam,
   ticketIdParam,
-  user,
   role,
   canReturnToConsole,
   onReturnToConsole,
@@ -63,10 +50,12 @@ export const ParticipantPortal: React.FC<Props> = ({
   const [events, setEvents] = useState<EventRecord[]>([]);
   const [selectedEventId, setSelectedEventId] = useState(eventIdParam || '');
   const [myTickets, setMyTickets] = useState<Array<{ participant: ParticipantRecord; event: EventRecord }>>([]);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
 
   // Registration state
-  const [fullName, setFullName] = useState(user?.displayName || '');
+  const [employeeId, setEmployeeId] = useState('');
+  const [fullName, setFullName] = useState('');
+  const [email, setEmail] = useState('');
   const [mobile, setMobile] = useState('');
   const [company, setCompany] = useState('');
   const [position, setPosition] = useState('');
@@ -75,8 +64,7 @@ export const ParticipantPortal: React.FC<Props> = ({
   // Self Check-In state
   const [selfEvent, setSelfEvent] = useState<EventRecord | null>(null);
   const [tokenValid, setTokenValid] = useState<boolean | null>(null);
-  const [matchedRegistrations, setMatchedRegistrations] = useState<ParticipantRecord[]>([]);
-  const [selectedRegId, setSelectedRegId] = useState('');
+  const [identifierInput, setIdentifierInput] = useState('');
   const [verifyInput, setVerifyInput] = useState('');
   const [checkInCompleted, setCheckInCompleted] = useState<{
     status: 'present' | 'late';
@@ -89,57 +77,38 @@ export const ParticipantPortal: React.FC<Props> = ({
   };
 
   useEffect(() => {
-    if (user?.displayName && !fullName) {
-      setFullName(user.displayName);
-    }
-  }, [user?.displayName, fullName]);
-
-  // Load portal data once signed in
-  useEffect(() => {
-    if (!user) return;
-    const activeUser = user;
     let cancelled = false;
 
     async function load() {
       setLoading(true);
       try {
         if (mode === 'self-checkin' && eventIdParam) {
-          const evSnap = await getDoc(doc(db, 'events', eventIdParam));
-          if (!evSnap.exists()) {
+          try {
+            const res = await fetchPublicEventStatus(eventIdParam, tokenParam);
+            if (!cancelled) {
+              setSelfEvent(res.event);
+              setTokenValid(res.tokenValid);
+            }
+          } catch {
             if (!cancelled) {
               setSelfEvent(null);
               setTokenValid(false);
             }
-            return;
-          }
-          const ev = evSnap.data() as EventRecord;
-          if (!cancelled) setSelfEvent(ev);
-
-          if (tokenParam) {
-            const tokSnap = await getDoc(doc(db, 'events', eventIdParam, 'qr_tokens', tokenParam));
-            const tokOk = tokSnap.exists() && (tokSnap.data() as QrTokenRecord).active === true;
-            if (!cancelled) setTokenValid(tokOk);
-          } else {
-            if (!cancelled) setTokenValid(false);
-          }
-
-          const regs = await findParticipantForSelfCheckIn({ eventId: eventIdParam, user: activeUser });
-          if (!cancelled) {
-            setMatchedRegistrations(regs);
-            if (regs.length > 0) setSelectedRegId(regs[0].id);
           }
         } else if (mode === 'ticket' && eventIdParam && ticketIdParam) {
-          const evSnap = await getDoc(doc(db, 'events', eventIdParam));
-          const pSnap = await getDoc(doc(db, 'events', eventIdParam, 'participants', ticketIdParam));
-          if (!cancelled && evSnap.exists() && pSnap.exists()) {
-            setMyTickets([{ event: evSnap.data() as EventRecord, participant: pSnap.data() as ParticipantRecord }]);
+          try {
+            const res = await fetchPublicTicket(eventIdParam, ticketIdParam);
+            if (!cancelled) {
+              setMyTickets([{ event: res.event, participant: res.participant }]);
+            }
+          } catch {
+            if (!cancelled) {
+              setMyTickets([]);
+              notify('error', 'Ticket Not Found', 'This QR pass link does not match a registered participant.');
+            }
           }
         } else {
-          // Registration + My Tickets mode
-          const evSnaps = await getDocs(
-            query(collection(db, 'events'), where('status', 'in', ['upcoming', 'active']))
-          );
-          const loadedEvents = evSnaps.docs.map((d) => d.data() as EventRecord);
+          const loadedEvents = await fetchPublicEvents();
           if (!cancelled) {
             setEvents(loadedEvents);
             if (loadedEvents.length > 0) {
@@ -150,19 +119,10 @@ export const ParticipantPortal: React.FC<Props> = ({
               setSelectedEventId(initialId);
             }
           }
-
-          const tickets: Array<{ participant: ParticipantRecord; event: EventRecord }> = [];
-          for (const ev of loadedEvents) {
-            const regs = await findParticipantForSelfCheckIn({ eventId: ev.id, user: activeUser });
-            for (const p of regs) {
-              tickets.push({ participant: p, event: ev });
-            }
-          }
-          if (!cancelled) setMyTickets(tickets);
         }
       } catch (error) {
         if (!cancelled) {
-          handleFirestoreError(error, OperationType.GET, 'events');
+          notify('error', 'Load Error', error instanceof Error ? error.message : 'Unable to load portal data.');
         }
       } finally {
         if (!cancelled) setLoading(false);
@@ -173,11 +133,10 @@ export const ParticipantPortal: React.FC<Props> = ({
     return () => {
       cancelled = true;
     };
-  }, [user, mode, eventIdParam, tokenParam, ticketIdParam]);
+  }, [mode, eventIdParam, tokenParam, ticketIdParam]);
 
   const handleSelfRegister = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!user || !user.email) return;
     const targetEvent = events.find((ev) => ev.id === selectedEventId);
     if (!targetEvent) {
       notify('warning', 'Select Event', 'Please choose an active event.');
@@ -188,7 +147,7 @@ export const ParticipantPortal: React.FC<Props> = ({
       return;
     }
 
-    const cleanEmail = sanitizeEmail(user.email);
+    const cleanEmail = sanitizeEmail(email);
     const err = validateParticipantInput({
       fullName,
       email: cleanEmail,
@@ -203,45 +162,29 @@ export const ParticipantPortal: React.FC<Props> = ({
 
     setSubmitting(true);
     try {
-      const { participantId, qrSecret } = await registerParticipant({
+      const { participant, event } = await registerParticipantPublic({
         eventId: targetEvent.id,
-        eventTitle: targetEvent.title,
+        employeeId: employeeId.trim(),
+        useEmployeeIdAsId: true,
         fullName,
         email: cleanEmail,
         mobile,
         company,
         position,
-        source: 'online',
-        actorRole: 'participant',
-        user,
       });
 
-      const created: ParticipantRecord = {
-        id: participantId,
-        eventId: targetEvent.id,
-        fullName: fullName.trim(),
-        email: cleanEmail,
-        mobile: mobile.trim(),
-        company: company.trim(),
-        position: position.trim(),
-        qrSecret,
-        registeredByUid: user.uid,
-        registrationSource: 'online',
-        registrationDate: null,
-        attendanceStatus: 'pending',
-        checkInAt: null,
-        checkInMethod: 'none',
-        checkedInByUid: '',
-        checkedInByEmail: '',
-        notes: '',
-        updatedAt: null,
-      };
-
-      setMyTickets((prev) => [{ participant: created, event: targetEvent }, ...prev]);
+      setMyTickets((prev) => [{ participant, event }, ...prev]);
+      setEmployeeId('');
+      setFullName('');
+      setEmail('');
       setMobile('');
       setCompany('');
       setPosition('');
-      notify('success', 'Registration Confirmed', `Your Unique ID is ${participantId}. Download your Individual QR Ticket below.`);
+      notify(
+        'success',
+        'Registration Confirmed',
+        `Your Unique ID is ${participant.id}. Download or screenshot your Individual QR Ticket below.`
+      );
     } catch (error) {
       notify('error', 'Registration Failed', error instanceof Error ? error.message : 'Unable to register.');
     } finally {
@@ -251,64 +194,32 @@ export const ParticipantPortal: React.FC<Props> = ({
 
   const handleSelfCheckIn = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!user || !selfEvent || !tokenParam) return;
-    const target = matchedRegistrations.find((r) => r.id === selectedRegId);
-    if (!target) {
-      notify('error', 'Registration Not Found', 'No matching participant registration found.');
-      return;
-    }
-
-    // Identity & registration verification: match Participant ID OR last 4+ digits of mobile
-    const trimmed = verifyInput.trim().toLowerCase();
-    const cleanTargetMobile = target.mobile.replace(/\D/g, '');
-    const cleanInputDigits = trimmed.replace(/\D/g, '');
-    const idMatches = target.id.toLowerCase() === trimmed;
-    const mobileMatches =
-      cleanInputDigits.length >= 4 && cleanTargetMobile.endsWith(cleanInputDigits);
-
-    if (!idMatches && !mobileMatches) {
-      notify(
-        'error',
-        'Verification Mismatch',
-        'Entered Participant ID or Mobile Number does not match your registration record.'
-      );
-      return;
-    }
-
-    if (target.attendanceStatus !== 'pending') {
-      notify(
-        'warning',
-        'Duplicate Check-In Prevented',
-        `You are already checked in (${target.attendanceStatus.toUpperCase()}) at ${formatTimestamp(target.checkInAt)}.`
-      );
+    if (!selfEvent || !tokenParam) return;
+    if (!identifierInput.trim() || !verifyInput.trim()) {
+      notify('error', 'Missing Details', 'Enter your Email or Participant ID and verification detail.');
       return;
     }
 
     setSubmitting(true);
     try {
-      const res = await performAtomicCheckIn({
-        event: selfEvent,
-        participantId: target.id,
-        method: 'shared_qr',
-        sharedQrToken: tokenParam,
-        actorRole: 'participant',
-        user,
+      const res = await performPublicSelfCheckIn({
+        eventId: selfEvent.id,
+        token: tokenParam,
+        identifier: identifierInput.trim(),
+        verifyValue: verifyInput.trim(),
       });
 
-      if (res.ok && res.participant) {
-        setCheckInCompleted({
-          status: res.assignedStatus || 'present',
-          message: res.message,
-          participant: res.participant,
-        });
-        setMatchedRegistrations((prev) =>
-          prev.map((p) => (p.id === target.id ? res.participant! : p))
-        );
-      } else {
-        notify('warning', 'Check-In Blocked', res.message);
-      }
+      setCheckInCompleted({
+        status: res.assignedStatus,
+        message: res.message,
+        participant: res.participant,
+      });
     } catch (error) {
-      notify('error', 'Check-In Failed', error instanceof Error ? error.message : 'Unable to complete self-check-in.');
+      notify(
+        'warning',
+        'Check-In Not Completed',
+        error instanceof Error ? error.message : 'Unable to complete self-check-in.'
+      );
     } finally {
       setSubmitting(false);
     }
@@ -319,7 +230,7 @@ export const ParticipantPortal: React.FC<Props> = ({
       {/* Corporate Header */}
       <header className="h-16 bg-[#0B1D3A] text-white px-4 sm:px-8 flex items-center justify-between gap-4 no-print">
         <div className="flex items-center gap-3">
-          <QrCode className="w-5 h-5 text-blue-300 shrink-0" />
+          <QrCode className="w-5 h-5 text-amber-300 shrink-0" />
           <span className="font-display font-semibold text-base tracking-tight whitespace-nowrap">
             Event Attendance System
           </span>
@@ -336,14 +247,14 @@ export const ParticipantPortal: React.FC<Props> = ({
               <span>Staff Console ({role})</span>
             </button>
           )}
-          {user && (
+          {!canReturnToConsole && (
             <button
               type="button"
-              onClick={() => signOutUser()}
+              onClick={onReturnToConsole}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white/10 hover:bg-white/20 text-white text-xs font-medium rounded-lg whitespace-nowrap"
             >
-              <LogOut className="w-3.5 h-3.5" />
-              <span>Sign Out</span>
+              <ArrowLeft className="w-3.5 h-3.5" />
+              <span>Staff Sign In</span>
             </button>
           )}
         </div>
@@ -352,32 +263,9 @@ export const ParticipantPortal: React.FC<Props> = ({
       <main className="flex-1 max-w-4xl w-full mx-auto p-4 sm:p-8">
         <NotificationBanner notification={notification} onDismiss={() => setNotification(null)} />
 
-        {!user ? (
-          <div className="bg-white border border-slate-200 rounded-xl p-8 max-w-md mx-auto text-center space-y-5 mt-8">
-            <ShieldCheck className="w-10 h-10 text-[#0B1D3A] mx-auto" />
-            <div>
-              <h1 className="font-display text-xl font-semibold text-[#0B1D3A]">
-                {mode === 'self-checkin'
-                  ? 'Verify Identity for Event Check-In'
-                  : mode === 'ticket'
-                    ? 'Verify Identity to View QR Ticket'
-                    : 'Online Event Registration'}
-              </h1>
-              <p className="text-sm text-slate-600 mt-2">
-                Sign in with your Google account to verify your identity, access your QR pass, or complete event check-in.
-              </p>
-            </div>
-            <button
-              type="button"
-              onClick={() => signInWithGoogle()}
-              className="w-full py-3 px-4 bg-[#0B1D3A] hover:bg-[#132B52] text-white text-sm font-medium rounded-lg transition-colors"
-            >
-              Continue with Google
-            </button>
-          </div>
-        ) : loading ? (
+        {loading ? (
           <div className="bg-white border border-slate-200 rounded-xl p-10 text-center text-sm text-slate-500">
-            Loading event details and verifying registration...
+            Loading event details...
           </div>
         ) : mode === 'self-checkin' ? (
           <div className="max-w-lg mx-auto space-y-6">
@@ -385,7 +273,9 @@ export const ParticipantPortal: React.FC<Props> = ({
               <div className="bg-white border border-slate-200 rounded-xl p-8 text-center space-y-2">
                 <AlertTriangle className="w-8 h-8 text-red-700 mx-auto" />
                 <h2 className="font-display text-lg font-semibold text-slate-900">Event Not Found</h2>
-                <p className="text-sm text-slate-600">This Shared Event QR link does not reference an active event.</p>
+                <p className="text-sm text-slate-600">
+                  This Shared Event QR link does not reference an active event.
+                </p>
               </div>
             ) : !selfEvent.sharedQrEnabled || selfEvent.status !== 'active' || !tokenValid ? (
               <div className="bg-white border border-slate-200 rounded-xl p-8 text-center space-y-3">
@@ -427,6 +317,12 @@ export const ParticipantPortal: React.FC<Props> = ({
                     <span className="text-slate-500">Company</span>
                     <span className="text-slate-800">{checkInCompleted.participant.company}</span>
                   </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">Check-In Time</span>
+                    <span className="font-mono text-xs text-slate-700">
+                      {formatTimestamp(checkInCompleted.participant.checkInAt)}
+                    </span>
+                  </div>
                   <p className="text-xs text-slate-500 pt-3 border-t border-slate-100">
                     Single-use attendance lock is now active for your registration. Duplicate submissions are automatically blocked.
                   </p>
@@ -434,106 +330,66 @@ export const ParticipantPortal: React.FC<Props> = ({
               </div>
             ) : (
               <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-                <div className="bg-[#0B1D3A] text-white px-6 py-5">
-                  <p className="text-xs text-slate-300">Mobile Self-Check-In</p>
+                <div className="bg-gradient-to-br from-[#061226] via-[#0B1D3A] to-[#172554] text-white px-6 py-5">
+                  <p className="text-xs font-semibold text-amber-300">JEZKA80 REWIND · MOBILE SELF-CHECK-IN</p>
                   <h1 className="font-display text-xl font-semibold mt-1">{selfEvent.title}</h1>
                   <p className="text-xs text-slate-300 mt-1 tabular-nums">
                     {selfEvent.eventDate} · {selfEvent.startTime} – {selfEvent.endTime} · {selfEvent.venue}
                   </p>
                 </div>
+                <div className="h-1 w-full bg-amber-500" />
+                <div className="h-1 w-full bg-rose-600" />
+                <div className="h-1 w-full bg-sky-400" />
 
                 <div className="p-6 space-y-5">
-                  <div className="text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-lg p-3">
-                    Signed in as <span className="font-semibold text-slate-900">{user.email}</span>
-                  </div>
-
-                  {matchedRegistrations.length === 0 ? (
-                    <div className="text-center space-y-3 py-4">
-                      <AlertTriangle className="w-8 h-8 text-amber-700 mx-auto" />
-                      <p className="text-sm font-medium text-slate-900">
-                        No Registration Found for {user.email}
-                      </p>
-                      <p className="text-xs text-slate-600">
-                        Register online first or ask the registration desk staff to locate your Participant ID.
-                      </p>
-                      {selfEvent.registrationOpen && (
-                        <a
-                          href={`?mode=register&eventId=${encodeURIComponent(selfEvent.id)}`}
-                          className="inline-block px-4 py-2 bg-[#0B1D3A] text-white text-xs font-medium rounded-lg"
-                        >
-                          Register for {selfEvent.title}
-                        </a>
-                      )}
+                  <form onSubmit={handleSelfCheckIn} className="space-y-4">
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">
+                        Registered Email, Employee ID No., or Participant ID
+                      </label>
+                      <input
+                        type="text"
+                        required
+                        value={identifierInput}
+                        onChange={(e) => setIdentifierInput(e.target.value)}
+                        placeholder="alex.mercer@company.com or EMP-1042"
+                        className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#1E40AF]"
+                      />
                     </div>
-                  ) : (
-                    <form onSubmit={handleSelfCheckIn} className="space-y-4">
-                      {matchedRegistrations.length > 1 && (
-                        <div>
-                          <label className="block text-xs font-semibold text-slate-700 mb-1">
-                            Select Registration
-                          </label>
-                          <select
-                            value={selectedRegId}
-                            onChange={(e) => setSelectedRegId(e.target.value)}
-                            className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
-                          >
-                            {matchedRegistrations.map((r) => (
-                              <option key={r.id} value={r.id}>
-                                {r.fullName} ({r.id})
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-                      )}
 
-                      {(() => {
-                        const chosen = matchedRegistrations.find((r) => r.id === selectedRegId);
-                        if (!chosen) return null;
-                        if (chosen.attendanceStatus !== 'pending') {
-                          return (
-                            <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 text-sm text-amber-900 space-y-1">
-                              <p className="font-semibold">Already Checked In</p>
-                              <p className="text-xs">
-                                {chosen.fullName} ({chosen.id}) checked in at{' '}
-                                <span className="font-mono">{formatTimestamp(chosen.checkInAt)}</span>.
-                              </p>
-                            </div>
-                          );
-                        }
-                        return (
-                          <>
-                            <div className="text-sm space-y-1">
-                              <p className="font-semibold text-slate-900">{chosen.fullName}</p>
-                              <p className="text-xs text-slate-500">
-                                {chosen.company} · {chosen.position}
-                              </p>
-                            </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">
+                        Verify Employee ID No., Participant ID, or Last 4+ Digits of Mobile
+                      </label>
+                      <input
+                        type="text"
+                        required
+                        value={verifyInput}
+                        onChange={(e) => setVerifyInput(e.target.value)}
+                        placeholder="e.g. EMP-1042, EVT-A9K2M4, or 2834"
+                        className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-[#1E40AF]"
+                      />
+                    </div>
 
-                            <div>
-                              <label className="block text-xs font-semibold text-slate-700 mb-1">
-                                Confirm Participant ID or Last 4+ Digits of Mobile
-                              </label>
-                              <input
-                                type="text"
-                                required
-                                value={verifyInput}
-                                onChange={(e) => setVerifyInput(e.target.value)}
-                                placeholder="e.g. EVT-A9K2M4 or 2834"
-                                className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-[#1E40AF]"
-                              />
-                            </div>
+                    <button
+                      type="submit"
+                      disabled={submitting}
+                      className="w-full py-3 bg-[#0B1D3A] hover:bg-[#132B52] text-white text-sm font-medium rounded-lg disabled:opacity-50"
+                    >
+                      {submitting ? 'Confirming Check-In...' : 'Complete Single-Use Check-In'}
+                    </button>
+                  </form>
 
-                            <button
-                              type="submit"
-                              disabled={submitting}
-                              className="w-full py-3 bg-[#1E40AF] hover:bg-[#1B3B6F] text-white text-sm font-medium rounded-lg disabled:opacity-50"
-                            >
-                              {submitting ? 'Confirming Check-In...' : 'Complete Self-Check-In'}
-                            </button>
-                          </>
-                        );
-                      })()}
-                    </form>
+                  {selfEvent.registrationOpen && (
+                    <div className="pt-4 border-t border-slate-100 text-center text-xs text-slate-500">
+                      Not registered yet?{' '}
+                      <a
+                        href={`?mode=register&eventId=${encodeURIComponent(selfEvent.id)}`}
+                        className="font-semibold text-[#1E40AF] hover:underline"
+                      >
+                        Register online first
+                      </a>
+                    </div>
                   )}
                 </div>
               </div>
@@ -577,7 +433,20 @@ export const ParticipantPortal: React.FC<Props> = ({
                       </select>
                     </div>
 
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                      <div>
+                        <label className="block text-xs font-semibold text-slate-700 mb-1">
+                          Employee ID No. (Optional)
+                        </label>
+                        <input
+                          type="text"
+                          maxLength={64}
+                          value={employeeId}
+                          onChange={(e) => setEmployeeId(e.target.value)}
+                          placeholder="EMP-1042"
+                          className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm font-mono"
+                        />
+                      </div>
                       <div>
                         <label className="block text-xs font-semibold text-slate-700 mb-1">
                           Full Name
@@ -588,18 +457,22 @@ export const ParticipantPortal: React.FC<Props> = ({
                           maxLength={100}
                           value={fullName}
                           onChange={(e) => setFullName(e.target.value)}
+                          placeholder="Alex Mercer"
                           className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
                         />
                       </div>
                       <div>
                         <label className="block text-xs font-semibold text-slate-700 mb-1">
-                          Verified Email
+                          Email Address
                         </label>
                         <input
                           type="email"
-                          readOnly
-                          value={user.email || ''}
-                          className="w-full px-3 py-2 border border-slate-200 bg-slate-50 text-slate-600 rounded-lg text-sm"
+                          required
+                          maxLength={120}
+                          value={email}
+                          onChange={(e) => setEmail(e.target.value)}
+                          placeholder="alex.mercer@company.com"
+                          className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
                         />
                       </div>
                     </div>
@@ -661,20 +534,16 @@ export const ParticipantPortal: React.FC<Props> = ({
               </div>
             )}
 
-            {/* My QR Tickets */}
-            <div className="space-y-4">
-              <div className="flex items-center gap-2 no-print">
-                <Ticket className="w-5 h-5 text-[#0B1D3A]" />
-                <h2 className="font-display text-lg font-semibold text-[#0B1D3A]">
-                  My QR Event Tickets ({myTickets.length})
-                </h2>
-              </div>
-
-              {myTickets.length === 0 ? (
-                <div className="bg-white border border-slate-200 rounded-xl p-8 text-center text-sm text-slate-500">
-                  You do not have any QR tickets under {user.email} yet.
+            {/* Generated / Direct QR Tickets */}
+            {myTickets.length > 0 && (
+              <div className="space-y-4">
+                <div className="flex items-center gap-2 no-print">
+                  <Ticket className="w-5 h-5 text-[#0B1D3A]" />
+                  <h2 className="font-display text-lg font-semibold text-[#0B1D3A]">
+                    Your QR Event Pass ({myTickets.length})
+                  </h2>
                 </div>
-              ) : (
+
                 <div className="space-y-6">
                   {myTickets.map(({ participant, event }) => (
                     <ParticipantTicketCard
@@ -684,8 +553,8 @@ export const ParticipantPortal: React.FC<Props> = ({
                     />
                   ))}
                 </div>
-              )}
-            </div>
+              </div>
+            )}
           </div>
         )}
       </main>

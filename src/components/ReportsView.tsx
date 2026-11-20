@@ -1,28 +1,25 @@
 import React, { useMemo } from 'react';
 import { Download, FileSpreadsheet, Printer } from 'lucide-react';
-import type { User } from 'firebase/auth';
-import type { EffectiveRole, EventRecord, ParticipantRecord } from '../types';
+import type { AuthUser, EffectiveRole, EventRecord, ParticipantRecord } from '../types';
 import {
   computeAttendanceStats,
   exportEventWorkbookXlsx,
   exportParticipantsCsv,
 } from '../lib/reportUtils';
 import { writeAuditLog } from '../lib/attendanceService';
-import { formatTimestamp } from '../lib/validation';
+import { formatTimestamp, toMillis } from '../lib/validation';
 
 interface Props {
   event: EventRecord | null;
   participants: ParticipantRecord[];
   role: EffectiveRole;
-  user: User;
+  user: AuthUser;
   onNotify: (type: 'success' | 'error' | 'warning' | 'info', title: string, message?: string) => void;
 }
 
 export const ReportsView: React.FC<Props> = ({
   event,
   participants,
-  role,
-  user,
   onNotify,
 }) => {
   const stats = computeAttendanceStats(participants);
@@ -44,7 +41,7 @@ export const ReportsView: React.FC<Props> = ({
     () =>
       participants
         .filter((p) => p.attendanceStatus === 'late')
-        .sort((a, b) => (a.checkInAt?.toMillis() || 0) - (b.checkInAt?.toMillis() || 0)),
+        .sort((a, b) => toMillis(a.checkInAt) - toMillis(b.checkInAt)),
     [participants]
   );
 
@@ -62,8 +59,6 @@ export const ReportsView: React.FC<Props> = ({
       await writeAuditLog({
         eventId: event.id,
         action: 'report_exported',
-        user,
-        actorRole: role,
         targetId: event.id,
         targetLabel: event.title,
         details: `Exported multi-sheet Excel (.xlsx) report (${participants.length} participants).`,
@@ -80,8 +75,6 @@ export const ReportsView: React.FC<Props> = ({
       await writeAuditLog({
         eventId: event.id,
         action: 'report_exported',
-        user,
-        actorRole: role,
         targetId: event.id,
         targetLabel: event.title,
         details: `Exported CSV attendance sheet (${participants.length} participants).`,
@@ -291,7 +284,8 @@ export const ReportsView: React.FC<Props> = ({
           <table className="w-full text-left border-collapse text-xs">
             <thead>
               <tr className="border-b border-slate-200 bg-slate-50 font-semibold text-slate-600">
-                <th className="py-2.5 px-3">ID</th>
+                <th className="py-2.5 px-3">Pass ID</th>
+                <th className="py-2.5 px-3">Employee ID</th>
                 <th className="py-2.5 px-3">Full Name</th>
                 <th className="py-2.5 px-3">Email</th>
                 <th className="py-2.5 px-3">Company</th>
@@ -304,8 +298,9 @@ export const ReportsView: React.FC<Props> = ({
               {participants.map((p) => (
                 <tr key={p.id}>
                   <td className="py-2 px-3 font-mono tabular-nums">{p.id}</td>
+                  <td className="py-2 px-3 font-mono tabular-nums text-slate-600">{p.employeeId || '—'}</td>
                   <td className="py-2 px-3 font-medium text-slate-900">{p.fullName}</td>
-                  <td className="py-2 px-3 text-slate-600">{p.email}</td>
+                  <td className="py-2 px-3 text-slate-600">{p.email || '—'}</td>
                   <td className="py-2 px-3 text-slate-700">{p.company}</td>
                   <td className="py-2 px-3 text-slate-600">{p.position}</td>
                   <td className="py-2 px-3 uppercase font-semibold">{p.attendanceStatus}</td>

@@ -11,24 +11,23 @@ import {
   Volume2,
   VolumeX,
 } from 'lucide-react';
-import type { User } from 'firebase/auth';
-import type { EffectiveRole, EventRecord, ParticipantRecord } from '../types';
-import { performAtomicCheckIn, type CheckInResult } from '../lib/attendanceService';
+import type { AuthUser, EffectiveRole, EventRecord, ParticipantRecord } from '../types';
+import { performStaffCheckIn, type CheckInResult } from '../lib/attendanceService';
 import { formatTimestamp, parseScannedQrText } from '../lib/validation';
 
 interface Props {
   event: EventRecord | null;
   participants: ParticipantRecord[];
   role: EffectiveRole;
-  user: User;
+  user: AuthUser;
+  onRefresh: () => Promise<void> | void;
   onNotify: (type: 'success' | 'error' | 'warning' | 'info', title: string, message?: string) => void;
 }
 
 export const ScannerView: React.FC<Props> = ({
   event,
   participants,
-  role,
-  user,
+  onRefresh,
   onNotify,
 }) => {
   const [cameraActive, setCameraActive] = useState(false);
@@ -115,16 +114,15 @@ export const ScannerView: React.FC<Props> = ({
 
     setProcessing(true);
     try {
-      const res = await performAtomicCheckIn({
-        event,
+      const res = await performStaffCheckIn({
+        eventId: event.id,
         participantId: parsed.participantId,
         expectedSecret: parsed.qrSecret,
         method: 'individual_qr',
-        actorRole: role,
-        user,
       });
       setLastResult(res);
       playTone(res.ok);
+      if (res.ok) await onRefresh();
     } catch (error) {
       playTone(false);
       onNotify('error', 'Scan Error', error instanceof Error ? error.message : 'Check-in transaction failed.');
@@ -204,16 +202,17 @@ export const ScannerView: React.FC<Props> = ({
     if (!cleanId) return;
     setProcessing(true);
     try {
-      const res = await performAtomicCheckIn({
-        event,
+      const res = await performStaffCheckIn({
+        eventId: event.id,
         participantId: cleanId,
         method: 'manual_staff',
-        actorRole: role,
-        user,
       });
       setLastResult(res);
       playTone(res.ok);
-      if (res.ok) setManualIdInput('');
+      if (res.ok) {
+        setManualIdInput('');
+        await onRefresh();
+      }
     } catch (error) {
       onNotify('error', 'Manual Check-In Failed', error instanceof Error ? error.message : 'Unable to check in.');
     } finally {
@@ -227,6 +226,7 @@ export const ScannerView: React.FC<Props> = ({
           const q = manualQuery.trim().toLowerCase();
           return (
             p.id.toLowerCase().includes(q) ||
+            (p.employeeId && p.employeeId.toLowerCase().includes(q)) ||
             p.fullName.toLowerCase().includes(q) ||
             p.email.toLowerCase().includes(q) ||
             p.company.toLowerCase().includes(q)
@@ -278,8 +278,9 @@ export const ScannerView: React.FC<Props> = ({
               <p className="text-sm mt-0.5">{lastResult.message}</p>
               {lastResult.participant && (
                 <p className="text-xs font-mono tabular-nums mt-1.5 opacity-80">
-                  ID: {lastResult.participant.id} · {lastResult.participant.company} (
-                  {lastResult.participant.position})
+                  ID: {lastResult.participant.id}
+                  {lastResult.participant.employeeId ? ` · Emp ID: ${lastResult.participant.employeeId}` : ''} ·{' '}
+                  {lastResult.participant.company} ({lastResult.participant.position})
                   {lastResult.participant.checkInAt &&
                     ` · Original Check-In: ${formatTimestamp(lastResult.participant.checkInAt)}`}
                 </p>
@@ -421,14 +422,14 @@ export const ScannerView: React.FC<Props> = ({
             className="space-y-2"
           >
             <label className="block text-xs font-semibold text-slate-700">
-              Direct Check-In by Participant ID
+              Direct Check-In by Participant ID or Employee ID No.
             </label>
             <div className="flex gap-2">
               <input
                 type="text"
                 value={manualIdInput}
                 onChange={(e) => setManualIdInput(e.target.value)}
-                placeholder="EVT-A9K2M4"
+                placeholder="EVT-A9K2M4 or EMP-1042"
                 className="flex-1 px-3 py-2 border border-slate-300 rounded-lg text-sm font-mono uppercase focus:outline-none focus:ring-2 focus:ring-[#1E40AF]"
               />
               <button
@@ -451,7 +452,7 @@ export const ScannerView: React.FC<Props> = ({
                 type="text"
                 value={manualQuery}
                 onChange={(e) => setManualQuery(e.target.value)}
-                placeholder="Search by name, email, company, or ID..."
+                placeholder="Search by name, Employee ID, email, company, or Pass ID..."
                 className="w-full pl-9 pr-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#1E40AF]"
               />
             </div>
@@ -470,7 +471,8 @@ export const ScannerView: React.FC<Props> = ({
                         <div className="min-w-0">
                           <p className="text-sm font-medium text-slate-900 truncate">{p.fullName}</p>
                           <p className="text-xs text-slate-500 truncate">
-                            <span className="font-mono">{p.id}</span> · {p.company}
+                            <span className="font-mono">{p.id}</span>
+                            {p.employeeId ? ` · Emp: ${p.employeeId}` : ''} · {p.company}
                           </p>
                         </div>
                         {alreadyIn ? (

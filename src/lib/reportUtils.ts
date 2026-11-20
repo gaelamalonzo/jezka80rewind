@@ -60,9 +60,10 @@ export function computeAttendanceStats(participants: ParticipantRecord[]): Atten
 function mapParticipantRow(p: ParticipantRecord) {
   return {
     'Participant ID': p.id,
+    'Employee ID No.': p.employeeId || '—',
     'Full Name': p.fullName,
-    Email: p.email,
-    Mobile: p.mobile,
+    Email: p.email || '—',
+    Mobile: p.mobile || '—',
     Company: p.company,
     Position: p.position,
     'Registration Source': p.registrationSource,
@@ -129,9 +130,9 @@ export function exportParticipantsCsv(event: EventRecord, participants: Particip
 
 export function downloadBulkImportTemplateCsv(): void {
   const sample = [
-    'Full Name,Email,Mobile,Company,Position',
-    'Elena Rostova,elena.rostova@company.com,+15550104421,Engineering,Principal Architect',
-    'Marcus Vance,marcus.vance@company.com,+15550108832,Operations,Program Director',
+    'Employee ID No,Full Name,Email,Mobile,Company,Position',
+    'EMP-1001,Elena Rostova,elena.rostova@company.com,+15550104421,Engineering,Principal Architect',
+    'EMP-1002,Marcus Vance,marcus.vance@company.com,+15550108832,Operations,Program Director',
   ].join('\n');
   const blob = new Blob([sample], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
@@ -142,37 +143,88 @@ export function downloadBulkImportTemplateCsv(): void {
   URL.revokeObjectURL(url);
 }
 
-export async function parseBulkSpreadsheet(file: File): Promise<
-  Array<{
-    fullName: string;
-    email: string;
-    mobile: string;
-    company: string;
-    position: string;
-  }>
-> {
+export interface ParsedBulkRow {
+  employeeId: string;
+  fullName: string;
+  email: string;
+  mobile: string;
+  company: string;
+  position: string;
+}
+
+export async function parseBulkSpreadsheet(file: File): Promise<ParsedBulkRow[]> {
   const buffer = await file.arrayBuffer();
   const wb = XLSX.read(buffer, { type: 'array' });
   const firstSheet = wb.Sheets[wb.SheetNames[0]];
   const rawRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(firstSheet, { defval: '' });
 
+  const normalizeKey = (k: string) =>
+    k
+      .trim()
+      .toLowerCase()
+      .replace(/[._-]+/g, ' ')
+      .replace(/\s+/g, ' ');
+
   return rawRows
     .map((r) => {
       const getField = (keys: string[]) => {
         for (const k of Object.keys(r)) {
-          if (keys.includes(k.trim().toLowerCase())) {
+          if (keys.includes(normalizeKey(k))) {
             return String(r[k] ?? '').trim();
           }
         }
         return '';
       };
+
+      const directName = getField([
+        'full name',
+        'fullname',
+        'name',
+        'attendee name',
+        'employee name',
+        'participant name',
+        'attendee',
+      ]);
+      const firstName = getField(['first name', 'firstname', 'given name']);
+      const middleName = getField(['middle name', 'middlename', 'mi']);
+      const lastName = getField(['last name', 'lastname', 'surname', 'family name']);
+      const combinedName = [firstName, middleName, lastName].filter(Boolean).join(' ').trim();
+
       return {
-        fullName: getField(['full name', 'fullname', 'name']),
-        email: getField(['email', 'email address', 'e-mail']).toLowerCase(),
-        mobile: getField(['mobile', 'phone', 'mobile number', 'contact']),
-        company: getField(['company', 'department', 'organization']) || 'Company',
-        position: getField(['position', 'role', 'title', 'job title']) || 'Attendee',
+        employeeId: getField([
+          'employee id no',
+          'employee id',
+          'employee no',
+          'emp id no',
+          'emp id',
+          'emp no',
+          'id no',
+          'id number',
+          'staff id',
+          'badge no',
+          'badge id',
+          'participant id',
+          'id',
+        ]),
+        fullName: directName || combinedName,
+        email: getField(['email', 'email address', 'e mail', 'work email', 'mail']).toLowerCase(),
+        mobile: getField([
+          'mobile',
+          'mobile no',
+          'mobile number',
+          'phone',
+          'phone no',
+          'phone number',
+          'contact',
+          'contact no',
+          'contact number',
+        ]),
+        company:
+          getField(['company', 'department', 'dept', 'organization', 'division', 'team', 'unit', 'section']) ||
+          'Company',
+        position:
+          getField(['position', 'role', 'title', 'job title', 'designation', 'rank']) || 'Attendee',
       };
     })
-    .filter((row) => row.fullName && row.email);
+    .filter((row) => row.fullName.length >= 2);
 }

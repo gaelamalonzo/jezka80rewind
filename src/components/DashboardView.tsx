@@ -10,8 +10,8 @@ import {
   Users,
   X,
 } from 'lucide-react';
-import type { User } from 'firebase/auth';
 import type {
+  AuthUser,
   EffectiveRole,
   EventRecord,
   EventStatus,
@@ -24,28 +24,29 @@ import {
   toggleSharedQrStatus,
   updateEventDetails,
 } from '../lib/attendanceService';
-import { formatTimeOnly, validateEventInput } from '../lib/validation';
+import { formatTimeOnly, toMillis, validateEventInput } from '../lib/validation';
 
 interface Props {
   role: EffectiveRole;
-  user: User;
+  user: AuthUser;
   events: EventRecord[];
   selectedEvent: EventRecord | null;
   participants: ParticipantRecord[];
   loadingParticipants: boolean;
   onSelectEvent: (eventId: string) => void;
+  onRefresh: () => Promise<void> | void;
   onNotify: (type: 'success' | 'error' | 'warning' | 'info', title: string, message?: string) => void;
   onNavigate: (view: 'scanner' | 'registration' | 'shared-qr' | 'attendance' | 'reports') => void;
 }
 
 export const DashboardView: React.FC<Props> = ({
   role,
-  user,
   events,
   selectedEvent,
   participants,
   loadingParticipants,
   onSelectEvent,
+  onRefresh,
   onNotify,
   onNavigate,
 }) => {
@@ -69,18 +70,22 @@ export const DashboardView: React.FC<Props> = ({
 
   const recentCheckIns = [...participants]
     .filter((p) => p.checkInAt !== null)
-    .sort((a, b) => (b.checkInAt?.toMillis() || 0) - (a.checkInAt?.toMillis() || 0))
+    .sort((a, b) => toMillis(b.checkInAt) - toMillis(a.checkInAt))
     .slice(0, 8);
 
   const openCreateModal = () => {
-    setTitle('');
-    setDescription('');
+    setTitle(events.length === 0 ? 'JEZKA80 REWIND' : '');
+    setDescription(
+      events.length === 0
+        ? 'JEZKA80 REWIND 1-day company event — registration, individual QR passes, and live check-in.'
+        : ''
+    );
     setEventDate(todayStr);
     setStartTime('09:00');
     setEndTime('17:00');
     setLateCutoffMinutes(15);
     setVenue('Main Corporate Auditorium');
-    setCapacity(600);
+    setCapacity(800);
     setStatus('active');
     setSharedQrEnabled(true);
     setRegistrationOpen(true);
@@ -134,9 +139,9 @@ export const DashboardView: React.FC<Props> = ({
           status,
           sharedQrEnabled,
           registrationOpen,
-          user,
         });
         onSelectEvent(eventId);
+        await onRefresh();
         onNotify('success', 'Event Created', `${title} is ready for participant registration and QR check-in.`);
       } else if (modalMode === 'edit' && selectedEvent) {
         await updateEventDetails({
@@ -154,8 +159,8 @@ export const DashboardView: React.FC<Props> = ({
             sharedQrEnabled,
             registrationOpen,
           },
-          user,
         });
+        await onRefresh();
         onNotify('success', 'Event Updated', `Saved changes for ${title}.`);
       }
       setModalMode(null);
@@ -170,10 +175,10 @@ export const DashboardView: React.FC<Props> = ({
     if (!selectedEvent || role !== 'admin') return;
     try {
       await toggleSharedQrStatus({
-        event: selectedEvent,
+        eventId: selectedEvent.id,
         enabled: !selectedEvent.sharedQrEnabled,
-        user,
       });
+      await onRefresh();
       onNotify(
         'success',
         `Shared Event QR ${!selectedEvent.sharedQrEnabled ? 'Enabled' : 'Disabled'}`,
@@ -194,12 +199,8 @@ export const DashboardView: React.FC<Props> = ({
       return;
     }
     try {
-      const count = await markPendingAsAbsent({
-        eventId: selectedEvent.id,
-        eventTitle: selectedEvent.title,
-        pendingParticipants: pendingList,
-        user,
-      });
+      const count = await markPendingAsAbsent(selectedEvent.id);
+      await onRefresh();
       onNotify('success', 'Attendance Finalized', `Marked ${count} remaining pending participants as Absent.`);
     } catch (error) {
       onNotify('error', 'Action Failed', error instanceof Error ? error.message : 'Could not mark pending as absent.');
